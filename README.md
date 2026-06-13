@@ -19,34 +19,6 @@
   - default route override выключен;
   - DNS override выключен.
 
-## Тема LuCI Proton2025
-
-Установка последней версии Proton2025 прямо на OpenWrt:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/install-proton2025-theme.sh | sh
-```
-
-Если на прошивке нет `wget`, но есть `curl`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/install-proton2025-theme.sh | sh
-```
-
-Скрипт каждый раз берет последний релиз из `ChesterGoodiny/luci-theme-proton2025` и сам выбирает `.apk` для `apk`-прошивок или `.ipk` для `opkg`-прошивок.
-
-Удаление Proton2025 и откат на стандартную тему LuCI:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/uninstall-proton2025-theme.sh | sh
-```
-
-Или через `curl`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/uninstall-proton2025-theme.sh | sh
-```
-
 ## Команды установки
 
 ### Быстрый вариант прямо на OpenWrt
