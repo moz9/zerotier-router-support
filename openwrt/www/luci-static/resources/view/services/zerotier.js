@@ -73,6 +73,24 @@ function setBusy(buttons, busy) {
 	});
 }
 
+function row(label, field, extraClass) {
+	return E('div', { 'class': 'zrs-row' + (extraClass ? ' ' + extraClass : '') }, [
+		E('div', { 'class': 'zrs-label' }, label),
+		E('div', { 'class': 'zrs-field' }, field)
+	]);
+}
+
+function inlineControls(input, button) {
+	return E('div', { 'class': 'zrs-inline' }, [
+		input,
+		button
+	]);
+}
+
+function actionGroup(items) {
+	return E('div', { 'class': 'zrs-actions' }, items);
+}
+
 return view.extend({
 	load: function() {
 		return L.resolveDefault(callStatus(), {});
@@ -80,25 +98,23 @@ return view.extend({
 
 	render: function(data) {
 		var networkInput = E('input', {
-			'class': 'cbi-input-text',
+			'class': 'cbi-input-text zrs-input',
 			'type': 'text',
 			'placeholder': '0123456789abcdef',
 			'value': parseCurrentNetworkId(outputText(data)),
 			'maxlength': '16',
 			'autocapitalize': 'none',
 			'autocomplete': 'off',
-			'spellcheck': 'false',
-			'style': 'min-width: 260px;'
+			'spellcheck': 'false'
 		});
 
 		var targetInput = E('input', {
-			'class': 'cbi-input-text',
+			'class': 'cbi-input-text zrs-input',
 			'type': 'text',
 			'placeholder': '10.0.0.1',
 			'autocapitalize': 'none',
 			'autocomplete': 'off',
-			'spellcheck': 'false',
-			'style': 'min-width: 220px;'
+			'spellcheck': 'false'
 		});
 
 		var output = E('pre', {
@@ -114,37 +130,37 @@ return view.extend({
 		}, outputText(data));
 
 		var refreshButton = E('button', {
-			'class': 'cbi-button',
+			'class': 'cbi-button zrs-button',
 			'type': 'button'
 		}, _('Обновить'));
 
 		var installButton = E('button', {
-			'class': 'cbi-button',
+			'class': 'cbi-button zrs-button',
 			'type': 'button'
 		}, _('Установить / починить'));
 
 		var joinButton = E('button', {
-			'class': 'cbi-button cbi-button-action',
+			'class': 'cbi-button cbi-button-action zrs-button',
 			'type': 'button'
 		}, _('Подключить / сохранить'));
 
 		var restartButton = E('button', {
-			'class': 'cbi-button',
+			'class': 'cbi-button zrs-button',
 			'type': 'button'
 		}, _('Перезапустить ZeroTier'));
 
 		var leaveButton = E('button', {
-			'class': 'cbi-button cbi-button-negative',
+			'class': 'cbi-button cbi-button-negative zrs-button',
 			'type': 'button'
 		}, _('Отключить от сети'));
 
 		var disableButton = E('button', {
-			'class': 'cbi-button cbi-button-negative',
+			'class': 'cbi-button cbi-button-negative zrs-button',
 			'type': 'button'
 		}, _('Выключить ZeroTier'));
 
 		var diagnoseButton = E('button', {
-			'class': 'cbi-button',
+			'class': 'cbi-button zrs-button',
 			'type': 'button'
 		}, _('Проверить связь'));
 
@@ -214,40 +230,39 @@ return view.extend({
 			run(diagnoseButton, callDiagnose(String(targetInput.value || '').trim()), _('Диагностика выполнена'));
 		});
 
-		return E('div', { 'class': 'cbi-map' }, [
+		return E('div', { 'class': 'cbi-map zrs-map' }, [
+			E('style', {}, [
+				'.zrs-panel { overflow: hidden; }',
+				'.zrs-intro { margin: 0 0 1.4rem; line-height: 1.55; max-width: 86rem; }',
+				'.zrs-row { display: grid; grid-template-columns: minmax(9rem, 13rem) minmax(0, 1fr); gap: .8rem 1.35rem; align-items: center; padding: .95rem 0; border-top: 1px solid rgba(127, 143, 164, .16); }',
+				'.zrs-row:first-of-type { border-top: 0; }',
+				'.zrs-label { font-weight: 600; line-height: 1.25; min-width: 0; }',
+				'.zrs-field { min-width: 0; }',
+				'.zrs-inline { display: grid; grid-template-columns: minmax(14rem, 44rem) max-content; gap: .55rem; align-items: center; max-width: 64rem; }',
+				'.zrs-input { width: 100%; min-width: 0 !important; box-sizing: border-box; }',
+				'.zrs-actions { display: flex; flex-wrap: wrap; gap: .55rem .7rem; align-items: center; min-width: 0; }',
+				'.zrs-button { white-space: nowrap; max-width: 100%; min-height: 2.35rem; }',
+				'@media (max-width: 760px) {',
+				'  .zrs-row { grid-template-columns: 1fr; align-items: stretch; }',
+				'  .zrs-inline { grid-template-columns: 1fr; max-width: none; }',
+				'  .zrs-actions { display: grid; grid-template-columns: 1fr; }',
+				'  .zrs-button { width: 100%; white-space: normal; }',
+				'}'
+			].join('\n')),
 			E('h2', _('ZeroTier')),
-			E('div', { 'class': 'cbi-section' }, [
-				E('p', _('ZeroTier используется только для удаленного доступа к роутеру. Маршруты по умолчанию, глобальные маршруты и DNS от ZeroTier остаются выключенными.')),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, _('Network ID')),
-					E('div', { 'class': 'cbi-value-field' }, [
-						networkInput,
-						' ',
-						joinButton
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, _('Цель проверки')),
-					E('div', { 'class': 'cbi-value-field' }, [
-						targetInput,
-						' ',
-						diagnoseButton
-					])
-				]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, _('Действия')),
-					E('div', { 'class': 'cbi-value-field' }, [
-						refreshButton,
-						' ',
-						installButton,
-						' ',
-						restartButton,
-						' ',
-						leaveButton,
-						' ',
-						disableButton
-					])
-				])
+			E('div', { 'class': 'cbi-section zrs-panel' }, [
+				E('p', { 'class': 'zrs-intro' }, _('ZeroTier используется только для удаленного доступа к роутеру. Маршруты по умолчанию, глобальные маршруты и DNS от ZeroTier остаются выключенными.')),
+				row(_('Network ID'), inlineControls(networkInput, joinButton)),
+				row(_('Цель проверки'), inlineControls(targetInput, diagnoseButton)),
+				row(_('Обслуживание'), actionGroup([
+					refreshButton,
+					installButton,
+					restartButton
+				])),
+				row(_('Отключение'), actionGroup([
+					leaveButton,
+					disableButton
+				]), 'zrs-danger-row')
 			]),
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', _('Диагностика')),
