@@ -20,6 +20,7 @@ pm_install_zerotier() {
 	fi
 
 	if command -v apk >/dev/null 2>&1; then
+		apk update || true
 		apk add zerotier
 		return $?
 	fi

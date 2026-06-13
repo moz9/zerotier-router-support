@@ -19,7 +19,11 @@
   - default route override выключен;
   - DNS override выключен.
 
-## Установка с GitHub
+## Команды установки
+
+### С Mac на роутер по SSH
+
+Этот вариант удобнее для первичной поддержки: он сам создает SSH-ключ на Mac и добавляет публичный ключ на роутер.
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/install.sh)
@@ -32,6 +36,40 @@ bash <(curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support
 - пароль root, либо пустое значение, если ключ поддержки уже установлен.
 
 Network ID на этом шаге не вводится.
+
+### Прямо на OpenWrt-роутере
+
+Этот вариант запускается в SSH-сессии самого роутера. Он ставит ZeroTier и LuCI-панель, но не добавляет SSH-ключ с Mac, если явно не передать `ZRS_PUBKEY`.
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+```
+
+Если на прошивке нет `wget`, но есть `curl`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+```
+
+## Совместимость OpenWrt
+
+Скрипт не привязан к архитектуре роутера. Архитектуру определяет сам пакетный менеджер OpenWrt, а наши файлы панели являются обычными текстовыми файлами.
+
+Поддержка пакетных менеджеров:
+
+- OpenWrt 24.10.x и старее: используется `opkg`;
+- OpenWrt 25.12.x и новее: используется `apk`;
+- если `zerotier` уже установлен, пакетный менеджер не вызывается.
+
+Пути LuCI/RPC определяются и создаются на роутере:
+
+- меню LuCI: `/usr/share/luci/menu.d`;
+- JS-страница LuCI: `/www/luci-static/resources/view/services`;
+- rpcd ucode: `/usr/share/rpcd/ucode`;
+- ACL rpcd: `/usr/share/rpcd/acl.d`;
+- helper: `/usr/libexec/zerotier-support/helper`.
+
+Если LuCI не установлена, скрипт остановится с понятной ошибкой. CLI-часть ZeroTier можно поставить, но графическая панель требует LuCI.
 
 ## Настройка в LuCI
 
