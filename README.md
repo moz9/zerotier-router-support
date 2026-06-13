@@ -21,6 +21,22 @@
 
 ## Команды установки
 
+### Быстрый вариант прямо на OpenWrt
+
+Подключитесь к роутеру по SSH и выполните:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+```
+
+Если на прошивке нет `wget`, но есть `curl`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+```
+
+После установки откройте LuCI: **Службы -> ZeroTier**, введите Network ID и авторизуйте роутер в ZeroTier Central.
+
 ### С Mac на роутер по SSH
 
 Этот вариант удобнее для первичной поддержки: он сам создает SSH-ключ на Mac и добавляет публичный ключ на роутер.
@@ -37,18 +53,52 @@ bash <(curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support
 
 Network ID на этом шаге не вводится.
 
-### Прямо на OpenWrt-роутере
+## Удаление
 
-Этот вариант запускается в SSH-сессии самого роутера. Он ставит ZeroTier и LuCI-панель, но не добавляет SSH-ключ с Mac, если явно не передать `ZRS_PUBKEY`.
+Перед удалением убедитесь, что у вас есть другой доступ к роутеру. После остановки ZeroTier удаленный вход через ZeroTier пропадет.
+
+### Удалить панель и настройки поддержки
+
+Выполните на роутере:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+ZT_NET="$(uci -q get zerotier.router_support.id || true)"
+[ -n "$ZT_NET" ] && zerotier-cli leave "$ZT_NET" 2>/dev/null || true
+
+/etc/init.d/zerotier stop 2>/dev/null || true
+/etc/init.d/zerotier disable 2>/dev/null || true
+
+uci -q delete zerotier.router_support || true
+uci -q delete firewall.zt_support || true
+uci -q delete firewall.allow_zt_support_router || true
+uci commit zerotier 2>/dev/null || true
+uci commit firewall 2>/dev/null || true
+
+rm -f \
+  /usr/libexec/zerotier-support/helper \
+  /usr/share/rpcd/ucode/zerotier.support \
+  /usr/share/rpcd/acl.d/zerotier-support.json \
+  /usr/share/luci/menu.d/zerotier-support.json \
+  /www/luci-static/resources/view/services/zerotier.js \
+  /www/luci-static/resources/view/system/zerotier-support.js
+rmdir /usr/libexec/zerotier-support 2>/dev/null || true
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
+
+/etc/init.d/firewall reload 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null || true
+/etc/init.d/rpcd restart 2>/dev/null || true
+/etc/init.d/uhttpd restart 2>/dev/null || true
 ```
 
-Если на прошивке нет `wget`, но есть `curl`:
+### Полностью удалить пакет ZeroTier
+
+Если ZeroTier больше не нужен на роутере:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
+if command -v apk >/dev/null 2>&1; then
+  apk del zerotier
+elif command -v opkg >/dev/null 2>&1; then
+  opkg remove zerotier
+fi
 ```
 
 ## Совместимость OpenWrt
