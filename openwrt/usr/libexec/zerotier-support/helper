@@ -1,0 +1,461 @@
+#!/bin/sh
+set -eu
+
+NETWORK_SECTION="router_support"
+FW_ZONE="zt_support"
+FW_RULE="allow_zt_support_router"
+
+is_hex16() {
+	printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{16}$'
+}
+
+is_safe_target() {
+	printf '%s' "$1" | grep -Eq '^[0-9A-Za-z:._/-]{1,128}$'
+}
+
+pm_install_zerotier() {
+	if command -v zerotier-cli >/dev/null 2>&1; then
+		echo "ZeroTier уже установлен."
+		return 0
+	fi
+
+	if command -v apk >/dev/null 2>&1; then
+		apk add zerotier
+		return $?
+	fi
+
+	if command -v opkg >/dev/null 2>&1; then
+		opkg update
+		opkg install zerotier
+		return $?
+	fi
+
+	echo "Не найден поддерживаемый менеджер пакетов: нужен apk или opkg." >&2
+	return 1
+}
+
+ensure_firewall() {
+	if ! uci -q get "firewall.${FW_ZONE}" >/dev/null; then
+		uci set "firewall.${FW_ZONE}=zone"
+	fi
+
+	uci set "firewall.${FW_ZONE}.name=${FW_ZONE}"
+	uci -q delete "firewall.${FW_ZONE}.network" || true
+	uci -q delete "firewall.${FW_ZONE}.device" || true
+	uci add_list "firewall.${FW_ZONE}.device=zt+"
+	uci set "firewall.${FW_ZONE}.input=REJECT"
+	uci set "firewall.${FW_ZONE}.output=ACCEPT"
+	uci set "firewall.${FW_ZONE}.forward=REJECT"
+
+	if ! uci -q get "firewall.${FW_RULE}" >/dev/null; then
+		uci set "firewall.${FW_RULE}=rule"
+	fi
+
+	uci set "firewall.${FW_RULE}.name=Allow-ZeroTier-Support-To-Router"
+	uci set "firewall.${FW_RULE}.src=${FW_ZONE}"
+	uci set "firewall.${FW_RULE}.proto=tcp"
+	uci -q delete "firewall.${FW_RULE}.dest_port" || true
+	uci add_list "firewall.${FW_RULE}.dest_port=22"
+	uci add_list "firewall.${FW_RULE}.dest_port=80"
+	uci add_list "firewall.${FW_RULE}.dest_port=443"
+	uci set "firewall.${FW_RULE}.target=ACCEPT"
+
+	if command -v fw4 >/dev/null 2>&1; then
+		fw4 check
+	fi
+
+	uci commit firewall
+	/etc/init.d/firewall reload || /etc/init.d/firewall restart
+}
+
+configure_network() {
+	network_id="$1"
+
+	if ! is_hex16 "$network_id"; then
+		echo "Неверный Network ID. Нужно 16 символов HEX, например 0123456789abcdef." >&2
+		return 2
+	fi
+
+	pm_install_zerotier
+	ensure_firewall
+
+	uci set zerotier.global=zerotier
+	uci set zerotier.global.enabled='1'
+	uci -q delete zerotier.earth || true
+	uci -q delete "zerotier.${NETWORK_SECTION}" || true
+	uci set "zerotier.${NETWORK_SECTION}=network"
+	uci set "zerotier.${NETWORK_SECTION}.id=${network_id}"
+	uci set "zerotier.${NETWORK_SECTION}.allow_managed=1"
+	uci set "zerotier.${NETWORK_SECTION}.allow_global=0"
+	uci set "zerotier.${NETWORK_SECTION}.allow_default=0"
+	uci set "zerotier.${NETWORK_SECTION}.allow_dns=0"
+	uci commit zerotier
+
+	/etc/init.d/zerotier enable
+	/etc/init.d/zerotier restart
+	sleep 5
+
+	status
+}
+
+leave_network() {
+	network_id="${1:-$(uci -q get "zerotier.${NETWORK_SECTION}.id" || true)}"
+	if [ -n "$network_id" ] && command -v zerotier-cli >/dev/null 2>&1; then
+		zerotier-cli leave "$network_id" || true
+	fi
+
+	uci -q delete "zerotier.${NETWORK_SECTION}" || true
+	uci commit zerotier
+	/etc/init.d/zerotier restart || true
+	status
+}
+
+disable_service() {
+	uci set zerotier.global=zerotier
+	uci set zerotier.global.enabled='0'
+	uci commit zerotier
+	/etc/init.d/zerotier stop || true
+	status
+}
+
+restart_service() {
+	/etc/init.d/zerotier restart
+	sleep 5
+	status
+}
+
+yn() {
+	case "$1" in
+		1|yes|true|on|enabled|OK) printf 'да' ;;
+		0|no|false|off|disabled|'') printf 'нет' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+value_or_dash() {
+	if [ -n "${1:-}" ]; then
+		printf '%s' "$1"
+	else
+		printf '-'
+	fi
+}
+
+network_status_ru() {
+	case "${1:-}" in
+		OK) printf 'подключена' ;;
+		ACCESS_DENIED) printf 'не авторизована в ZeroTier Central' ;;
+		REQUESTING_CONFIGURATION) printf 'ждет авторизации или выдачи IP' ;;
+		NOT_FOUND) printf 'сеть не найдена' ;;
+		PORT_ERROR) printf 'ошибка UDP-порта ZeroTier' ;;
+		*) value_or_dash "${1:-}" ;;
+	esac
+}
+
+client_status_ru() {
+	case "${1:-}" in
+		ONLINE) printf 'в сети' ;;
+		OFFLINE) printf 'не в сети' ;;
+		*) value_or_dash "${1:-}" ;;
+	esac
+}
+
+network_type_ru() {
+	case "${1:-}" in
+		PRIVATE) printf 'приватная' ;;
+		PUBLIC) printf 'публичная' ;;
+		*) value_or_dash "${1:-}" ;;
+	esac
+}
+
+policy_ru() {
+	case "${1:-}" in
+		ACCEPT) printf 'разрешено' ;;
+		REJECT) printf 'запрещено' ;;
+		DROP) printf 'сбрасывается' ;;
+		*) value_or_dash "${1:-}" ;;
+	esac
+}
+
+collect_state() {
+	zt_installed=0
+	zt_service_enabled=0
+	zt_running=0
+	zt_info=''
+	zt_networks=''
+	zt_peers=''
+	zt_node='-'
+	zt_version='-'
+	zt_state='-'
+	network_id="$(uci -q get "zerotier.${NETWORK_SECTION}.id" 2>/dev/null || true)"
+	network_line=''
+	network_name='-'
+	network_status='-'
+	network_type='-'
+	zt_device='-'
+	zt_ips='-'
+	peer_count=0
+	direct_peer_count=0
+
+	command -v zerotier-cli >/dev/null 2>&1 && zt_installed=1
+	/etc/init.d/zerotier enabled >/dev/null 2>&1 && zt_service_enabled=1 || true
+	pidof zerotier-one >/dev/null 2>&1 && zt_running=1 || true
+
+	if [ "$zt_installed" = 1 ]; then
+		zt_info="$(zerotier-cli info 2>&1 || true)"
+		zt_networks="$(zerotier-cli listnetworks 2>&1 || true)"
+		zt_peers="$(zerotier-cli listpeers 2>&1 || true)"
+
+		zt_node="$(printf '%s\n' "$zt_info" | awk '/^200 info / {print $3; exit}')"
+		zt_version="$(printf '%s\n' "$zt_info" | awk '/^200 info / {print $4; exit}')"
+		zt_state="$(printf '%s\n' "$zt_info" | awk '/^200 info / {print $5; exit}')"
+		[ -n "$zt_node" ] || zt_node='-'
+		[ -n "$zt_version" ] || zt_version='-'
+		[ -n "$zt_state" ] || zt_state='-'
+
+		if [ -n "$network_id" ]; then
+			network_line="$(printf '%s\n' "$zt_networks" | awk -v id="$network_id" '$2 == "listnetworks" && $3 == id {print; exit}')"
+		else
+			network_line="$(printf '%s\n' "$zt_networks" | awk '$2 == "listnetworks" && $3 != "<nwid>" {print; exit}')"
+		fi
+
+		if [ -n "$network_line" ]; then
+			network_id="$(printf '%s\n' "$network_line" | awk '{print $3}')"
+			network_name="$(printf '%s\n' "$network_line" | awk '{print $4}')"
+			network_status="$(printf '%s\n' "$network_line" | awk '{print $6}')"
+			network_type="$(printf '%s\n' "$network_line" | awk '{print $7}')"
+			zt_device="$(printf '%s\n' "$network_line" | awk '{print $8}')"
+			zt_ips="$(printf '%s\n' "$network_line" | awk '{for (i=9; i<=NF; i++) printf "%s%s", (i==9 ? "" : " "), $i}')"
+			[ -n "$zt_ips" ] || zt_ips='-'
+		fi
+
+		peer_count="$(printf '%s\n' "$zt_peers" | awk '$2 == "listpeers" && $3 != "<ztaddr>" {count++} END {print count + 0}')"
+		direct_peer_count="$(printf '%s\n' "$zt_peers" | awk '$2 == "listpeers" && $3 != "<ztaddr>" && $4 != "-" {count++} END {print count + 0}')"
+	fi
+
+	allow_managed="$(uci -q get "zerotier.${NETWORK_SECTION}.allow_managed" 2>/dev/null || true)"
+	allow_global="$(uci -q get "zerotier.${NETWORK_SECTION}.allow_global" 2>/dev/null || true)"
+	allow_default="$(uci -q get "zerotier.${NETWORK_SECTION}.allow_default" 2>/dev/null || true)"
+	allow_dns="$(uci -q get "zerotier.${NETWORK_SECTION}.allow_dns" 2>/dev/null || true)"
+
+	fw_input="$(uci -q get "firewall.${FW_ZONE}.input" 2>/dev/null || true)"
+	fw_forward="$(uci -q get "firewall.${FW_ZONE}.forward" 2>/dev/null || true)"
+	fw_output="$(uci -q get "firewall.${FW_ZONE}.output" 2>/dev/null || true)"
+	fw_device="$(uci -q get "firewall.${FW_ZONE}.device" 2>/dev/null || true)"
+	fw_ports="$(uci -q get "firewall.${FW_RULE}.dest_port" 2>/dev/null || true)"
+	fw_target="$(uci -q get "firewall.${FW_RULE}.target" 2>/dev/null || true)"
+
+	zt_forwarding_found=0
+	for section in $(uci -q show firewall | sed -n 's/^firewall\.\([^=]*\)=forwarding$/\1/p'); do
+		src="$(uci -q get "firewall.${section}.src" 2>/dev/null || true)"
+		[ "$src" = "$FW_ZONE" ] && zt_forwarding_found=1
+	done
+
+	default_route_zt=0
+	ip route show default 2>/dev/null | grep -Eq ' dev zt[a-zA-Z0-9]+' && default_route_zt=1 || true
+
+	podkop_sources="$(uci -q get podkop.settings.source_network_interfaces 2>/dev/null || true)"
+	podkop_output="$(uci -q get podkop.settings.enable_output_network_interface 2>/dev/null || true)"
+}
+
+overall_state() {
+	if [ "$zt_installed" != 1 ]; then
+		printf 'ZeroTier не установлен'
+	elif [ "$zt_running" != 1 ]; then
+		printf 'служба ZeroTier не запущена'
+	elif [ "$zt_state" != ONLINE ]; then
+		printf 'ZeroTier не в сети: %s' "$zt_state"
+	elif [ -z "$network_id" ]; then
+		printf 'Network ID не задан'
+	elif [ "$network_status" = ACCESS_DENIED ] || [ "$network_status" = REQUESTING_CONFIGURATION ]; then
+		printf 'роутер ждет авторизации в ZeroTier Central'
+	elif [ "$network_status" != OK ]; then
+		printf 'сеть ZeroTier не готова: %s' "$network_status"
+	elif [ "$zt_ips" = '-' ]; then
+		printf 'сеть подключена, но IP еще не выдан'
+	else
+		printf 'работает, можно подключаться по ZeroTier IP'
+	fi
+}
+
+next_action() {
+	if [ "$zt_installed" != 1 ]; then
+		printf 'нажмите "Установить / починить"'
+	elif [ "$zt_running" != 1 ]; then
+		printf 'нажмите "Перезапустить ZeroTier"'
+	elif [ -z "$network_id" ]; then
+		printf 'введите Network ID и нажмите "Подключить / сохранить"'
+	elif [ "$network_status" = ACCESS_DENIED ] || [ "$network_status" = REQUESTING_CONFIGURATION ]; then
+		printf 'откройте ZeroTier Central, авторизуйте этот роутер и обновите статус'
+	elif [ "$zt_ips" != '-' ]; then
+		printf 'подключайтесь: ssh root@%s или откройте http://%s/cgi-bin/luci/' "$(printf '%s' "$zt_ips" | cut -d/ -f1)" "$(printf '%s' "$zt_ips" | cut -d/ -f1)"
+	else
+		printf 'подождите 10-30 секунд и обновите статус'
+	fi
+}
+
+print_friendly_report() {
+	zt_ip_plain="$(printf '%s' "$zt_ips" | cut -d/ -f1)"
+	[ "$zt_ips" = '-' ] && zt_ip_plain='-'
+
+	echo "== Краткий итог =="
+	printf 'Состояние: %s\n' "$(overall_state)"
+	printf 'Что сделать: %s\n' "$(next_action)"
+
+	echo
+	echo "== Подключение ZeroTier =="
+	printf 'ZeroTier установлен: %s\n' "$(yn "$zt_installed")"
+	printf 'Автозапуск службы: %s\n' "$(yn "$zt_service_enabled")"
+	printf 'Процесс запущен: %s\n' "$(yn "$zt_running")"
+	printf 'Статус клиента: %s\n' "$(client_status_ru "$zt_state")"
+	printf 'Версия ZeroTier: %s\n' "$(value_or_dash "$zt_version")"
+	printf 'Node ID роутера: %s\n' "$(value_or_dash "$zt_node")"
+	printf 'Network ID: %s\n' "$(value_or_dash "$network_id")"
+	printf 'Название сети: %s\n' "$(value_or_dash "$network_name")"
+	printf 'Статус сети: %s\n' "$(network_status_ru "$network_status")"
+	printf 'Тип сети: %s\n' "$(network_type_ru "$network_type")"
+	printf 'Интерфейс: %s\n' "$(value_or_dash "$zt_device")"
+	printf 'ZeroTier IP: %s\n' "$(value_or_dash "$zt_ips")"
+	printf 'Подключение для SSH: %s\n' "$([ "$zt_ip_plain" != '-' ] && printf 'ssh root@%s' "$zt_ip_plain" || printf '-')"
+	printf 'Подключение для LuCI: %s\n' "$([ "$zt_ip_plain" != '-' ] && printf 'http://%s/cgi-bin/luci/' "$zt_ip_plain" || printf '-')"
+	printf 'Пиры ZeroTier: всего %s, с прямым/активным путем %s\n' "$peer_count" "$direct_peer_count"
+
+	echo
+	echo "== Безопасность маршрутов =="
+	printf 'Адреса из ZeroTier разрешены: %s\n' "$(yn "$allow_managed")"
+	printf 'Глобальные маршруты из ZeroTier: %s\n' "$(yn "$allow_global")"
+	printf 'Маршрут по умолчанию из ZeroTier: %s\n' "$(yn "$allow_default")"
+	printf 'DNS из ZeroTier: %s\n' "$(yn "$allow_dns")"
+	printf 'Основной маршрут через ZeroTier: %s\n' "$(yn "$default_route_zt")"
+	if [ "$allow_global" = 0 ] && [ "$allow_default" = 0 ] && [ "$allow_dns" = 0 ] && [ "$default_route_zt" = 0 ]; then
+		echo "Оценка: ZeroTier не должен перехватывать интернет-трафик роутера."
+	else
+		echo "Оценка: проверьте настройки, ZeroTier может влиять на маршрутизацию."
+	fi
+
+	echo
+	echo "== Доступ к роутеру =="
+	printf 'Firewall зона: %s\n' "$(value_or_dash "$FW_ZONE")"
+	printf 'Устройства зоны: %s\n' "$(value_or_dash "$fw_device")"
+	printf 'Политика входа из ZeroTier: %s\n' "$(policy_ru "$fw_input")"
+	printf 'Политика выхода в ZeroTier: %s\n' "$(policy_ru "$fw_output")"
+	printf 'Политика переадресации из ZeroTier: %s\n' "$(policy_ru "$fw_forward")"
+	printf 'Проброс ZeroTier -> LAN/WAN найден: %s\n' "$(yn "$zt_forwarding_found")"
+	printf 'Порты, открытые только к роутеру: %s\n' "$(value_or_dash "$fw_ports")"
+	printf 'Правило доступа к SSH/LuCI активно: %s\n' "$([ "$fw_target" = ACCEPT ] && printf 'да' || printf 'нет')"
+
+	echo
+	echo "== Проверка podkop =="
+	printf 'Интерфейсы podkop source: %s\n' "$(value_or_dash "$podkop_sources")"
+	printf 'Маршрутизация исходящего трафика в podkop: %s\n' "$(yn "$podkop_output")"
+	if printf '%s\n' "$podkop_sources" | grep -Eq '(^|[[:space:]])zt'; then
+		echo "Оценка: внимание, ZeroTier попал в source interfaces podkop."
+	else
+		echo "Оценка: ZeroTier не включен в source interfaces podkop."
+	fi
+}
+
+print_technical_details() {
+	echo
+	echo "== Технические детали =="
+	if [ "$zt_installed" = 1 ]; then
+		echo "-- zerotier-cli info --"
+		printf '%s\n' "$zt_info"
+		echo
+		echo "-- zerotier-cli listnetworks --"
+		printf '%s\n' "$zt_networks"
+	else
+		echo "ZeroTier не установлен."
+	fi
+
+	echo
+	echo "-- zerotier config без секрета --"
+	uci -q show zerotier 2>/dev/null | sed "s/^zerotier\.global\.secret=.*/zerotier.global.secret='<hidden>'/" || true
+
+	echo
+	echo "-- zt interfaces --"
+	ip addr show 2>/dev/null | sed -n '/zt/,+5p' || true
+
+	echo
+	echo "-- routes --"
+	ip route show table main 2>/dev/null || true
+	ip rule show 2>/dev/null || true
+
+	echo
+	echo "-- firewall --"
+	uci -q show "firewall.${FW_ZONE}" || true
+	uci -q show "firewall.${FW_RULE}" || true
+}
+
+status() {
+	collect_state
+	print_friendly_report
+	print_technical_details
+}
+
+diagnose() {
+	target="${1:-}"
+	collect_state
+	print_friendly_report
+
+	if [ -n "$target" ]; then
+		if ! is_safe_target "$target"; then
+			echo
+			echo "Неверная цель диагностики." >&2
+			return 2
+		fi
+
+		echo
+		echo "== Проверка связи =="
+		echo "Цель: ${target}"
+		if ping_out="$(ping -c 3 -W 2 "$target" 2>&1)"; then
+			loss="$(printf '%s\n' "$ping_out" | sed -n 's/.* \([0-9.]*%\) packet loss.*/\1/p' | tail -1)"
+			avg="$(printf '%s\n' "$ping_out" | sed -n 's/.*round-trip min\/avg\/max = [^/]*\/\([^/]*\)\/.*/\1 ms/p' | tail -1)"
+			echo "Результат: ответ есть"
+			[ -n "$loss" ] && echo "Потери: ${loss}"
+			[ -n "$avg" ] && echo "Средняя задержка: ${avg}"
+		else
+			echo "Результат: ответа по ping нет"
+			echo "Что это значит: цель недоступна или на ней запрещен ICMP. Для LuCI проверяйте адрес в браузере, для SSH - подключение к порту 22."
+		fi
+	fi
+
+	echo
+	echo "== Пиры ZeroTier =="
+	if command -v zerotier-cli >/dev/null 2>&1; then
+		zerotier-cli listpeers 2>&1 || true
+	else
+		echo "ZeroTier не установлен."
+	fi
+
+	print_technical_details
+}
+
+case "${1:-status}" in
+	install)
+		pm_install_zerotier
+		ensure_firewall
+		status
+		;;
+	configure)
+		configure_network "${2:-}"
+		;;
+	leave)
+		leave_network "${2:-}"
+		;;
+	disable)
+		disable_service
+		;;
+	restart)
+		restart_service
+		;;
+	diagnose)
+		diagnose "${2:-}"
+		;;
+	status)
+		status
+		;;
+	*)
+		echo "Usage: $0 {status|install|configure <network-id>|leave [network-id]|disable|restart|diagnose [target]}" >&2
+		exit 2
+		;;
+esac

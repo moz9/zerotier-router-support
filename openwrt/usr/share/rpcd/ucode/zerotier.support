@@ -1,0 +1,152 @@
+'use strict';
+
+import { popen } from 'fs';
+
+const HELPER = '/usr/libexec/zerotier-support/helper';
+
+function normalize(value) {
+	if (value == null) {
+		return '';
+	}
+
+	return '' + value;
+}
+
+function isHex16(value) {
+	return match(normalize(value), /^[0-9a-fA-F]{16}$/) != null;
+}
+
+function isSafeTarget(value) {
+	value = normalize(value);
+
+	if (!length(value)) {
+		return true;
+	}
+
+	return match(value, /^[0-9A-Za-z:._/-]{1,128}$/) != null;
+}
+
+function run(args) {
+	let command = HELPER;
+
+	for (let i = 0; i < length(args); i++) {
+		command += ' ' + args[i];
+	}
+
+	try {
+		let proc = popen(command + ' 2>&1', 'r');
+
+		if (!proc) {
+			return { success: false, output: 'Не удалось запустить помощник ZeroTier.' };
+		}
+
+		let output = proc.read('all');
+		let rc = proc.close();
+
+		return {
+			success: rc == 0 || rc == null,
+			code: rc ?? 0,
+			output: normalize(output)
+		};
+	} catch (error) {
+		return { success: false, output: 'Ошибка выполнения помощника ZeroTier.' };
+	}
+}
+
+function status() {
+	return run(['status']);
+}
+
+function install() {
+	return run(['install']);
+}
+
+function configure(req) {
+	let networkId = normalize(req.args?.network_id);
+
+	if (!isHex16(networkId)) {
+		return {
+			success: false,
+			output: 'Неверный Network ID. Нужно 16 символов HEX, например 0123456789abcdef.'
+		};
+	}
+
+	return run(['configure', networkId]);
+}
+
+function leave(req) {
+	let networkId = normalize(req.args?.network_id);
+
+	if (length(networkId) && !isHex16(networkId)) {
+		return {
+			success: false,
+			output: 'Неверный Network ID. Нужно 16 символов HEX, например 0123456789abcdef.'
+		};
+	}
+
+	return length(networkId) ? run(['leave', networkId]) : run(['leave']);
+}
+
+function restart() {
+	return run(['restart']);
+}
+
+function disable() {
+	return run(['disable']);
+}
+
+function diagnose(req) {
+	let target = normalize(req.args?.target);
+
+	if (!isSafeTarget(target)) {
+		return {
+			success: false,
+			output: 'Неверная цель диагностики.'
+		};
+	}
+
+	return length(target) ? run(['diagnose', target]) : run(['diagnose']);
+}
+
+const methods = {
+	status: {
+		call: function() {
+			return status();
+		}
+	},
+	install: {
+		call: function() {
+			return install();
+		}
+	},
+	configure: {
+		args: { network_id: 'network_id' },
+		call: function(req) {
+			return configure(req);
+		}
+	},
+	leave: {
+		args: { network_id: 'network_id' },
+		call: function(req) {
+			return leave(req);
+		}
+	},
+	restart: {
+		call: function() {
+			return restart();
+		}
+	},
+	disable: {
+		call: function() {
+			return disable();
+		}
+	},
+	diagnose: {
+		args: { target: 'target' },
+		call: function(req) {
+			return diagnose(req);
+		}
+	}
+};
+
+return { 'zerotier.support': methods };

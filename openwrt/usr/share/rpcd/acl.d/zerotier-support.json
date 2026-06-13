@@ -1,0 +1,35 @@
+{
+  "zerotier-support": {
+    "description": "ZeroTier router support panel",
+    "read": {
+      "ubus": {
+        "zerotier.support": [
+          "status",
+          "diagnose"
+        ]
+      },
+      "uci": [
+        "zerotier",
+        "firewall",
+        "dropbear",
+        "podkop"
+      ]
+    },
+    "write": {
+      "ubus": {
+        "zerotier.support": [
+          "install",
+          "configure",
+          "leave",
+          "restart",
+          "disable",
+          "diagnose"
+        ]
+      },
+      "uci": [
+        "zerotier",
+        "firewall"
+      ]
+    }
+  }
+}

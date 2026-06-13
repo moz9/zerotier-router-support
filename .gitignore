@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+*.tmp
+secrets/
+known_hosts/
+backups/
