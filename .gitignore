@@ -1,6 +1,38 @@
+# Local/editor state
 .DS_Store
+Thumbs.db
 *.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs, build outputs, and transfer bundles
+*.log
 *.tmp
-secrets/
-known_hosts/
+*.temp
+*.bak
+*.zip
+*.tar.gz
+*.7z
+*.rar
+dist/
+build/
+release/
+out/
 backups/
+known_hosts/
+
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+cred_*
+credentials*
+secrets*
+token*
+*.kdbx
