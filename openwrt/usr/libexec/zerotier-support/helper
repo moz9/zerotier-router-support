@@ -4,6 +4,13 @@ set -eu
 NETWORK_SECTION="router_support"
 FW_ZONE="zt_support"
 FW_RULE="allow_zt_support_router"
+ZT_PRIMARY_PORT="9993"
+ZT_SECONDARY_PORT="25534"
+ZT_TERTIARY_PORT="34923"
+ZT_SUPPORT_LOCAL_CONF="/etc/zerotier-router-support.conf"
+ZT_BYPASS_FILE="/etc/nftables.d/20-podkop-zerotier-bypass.nft"
+ZT_LOCAL_CONF_TEMPLATE="/usr/libexec/zerotier-support/zerotier-router-support.conf"
+ZT_BYPASS_TEMPLATE="/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
 
 is_hex16() {
 	printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{16}$'
@@ -33,6 +40,102 @@ pm_install_zerotier() {
 
 	echo "Не найден поддерживаемый менеджер пакетов: нужен apk или opkg." >&2
 	return 1
+}
+
+current_zerotier_ports() {
+	if ! command -v zerotier-cli >/dev/null 2>&1 || ! command -v jsonfilter >/dev/null 2>&1; then
+		return 0
+	fi
+
+	zt_json="$(zerotier-cli info -j 2>/dev/null || true)"
+	[ -n "$zt_json" ] || return 0
+	for expression in '@.config.settings.primaryPort' '@.config.settings.secondaryPort' '@.config.settings.tertiaryPort'; do
+		printf '%s\n' "$zt_json" | jsonfilter -e "$expression" 2>/dev/null || true
+	done
+}
+
+ensure_transport_independence() {
+	if [ ! -s "$ZT_LOCAL_CONF_TEMPLATE" ] || [ ! -s "$ZT_BYPASS_TEMPLATE" ]; then
+		echo "Не найдены шаблоны защиты транспорта ZeroTier. Повторите установку панели." >&2
+		return 1
+	fi
+
+	mkdir -p /etc/nftables.d
+	bypass_ports="$ZT_PRIMARY_PORT $ZT_SECONDARY_PORT $ZT_TERTIARY_PORT"
+	for runtime_port in $(current_zerotier_ports); do
+		case "$runtime_port" in
+			''|*[!0-9]*) continue ;;
+		esac
+		[ "$runtime_port" -ge 1 ] 2>/dev/null && [ "$runtime_port" -le 65535 ] 2>/dev/null || continue
+		case " $bypass_ports " in
+			*" $runtime_port "*) ;;
+			*) bypass_ports="$bypass_ports $runtime_port" ;;
+		esac
+	done
+	bypass_elements="$(printf '%s' "$bypass_ports" | sed 's/[[:space:]][[:space:]]*/, /g')"
+	nft_candidate="/tmp/zrs-bypass-candidate.$$"
+	sed "s/^[[:space:]]*elements = {.*}/\telements = { $bypass_elements }/" "$ZT_BYPASS_TEMPLATE" > "$nft_candidate"
+
+	nft_changed=0
+	if [ ! -f "$ZT_BYPASS_FILE" ] || ! cmp -s "$nft_candidate" "$ZT_BYPASS_FILE"; then
+		nft_previous="/tmp/zrs-bypass-previous.$$"
+		[ -f "$ZT_BYPASS_FILE" ] && cp -p "$ZT_BYPASS_FILE" "$nft_previous" || true
+		cp "$nft_candidate" "${ZT_BYPASS_FILE}.new"
+		chmod 0644 "${ZT_BYPASS_FILE}.new"
+		mv "${ZT_BYPASS_FILE}.new" "$ZT_BYPASS_FILE"
+		nft_changed=1
+	fi
+	rm -f "$nft_candidate"
+
+	current_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
+	if [ -z "$current_local_conf" ] || [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ]; then
+		if [ ! -f "$ZT_SUPPORT_LOCAL_CONF" ] || ! cmp -s "$ZT_LOCAL_CONF_TEMPLATE" "$ZT_SUPPORT_LOCAL_CONF"; then
+			cp "$ZT_LOCAL_CONF_TEMPLATE" "${ZT_SUPPORT_LOCAL_CONF}.new"
+			chmod 0600 "${ZT_SUPPORT_LOCAL_CONF}.new"
+			mv "${ZT_SUPPORT_LOCAL_CONF}.new" "$ZT_SUPPORT_LOCAL_CONF"
+		fi
+		current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
+	else
+		if [ ! -f "$current_local_conf" ]; then
+			echo "Указанный ZeroTier local.conf не найден: $current_local_conf" >&2
+			return 1
+		fi
+		if ! command -v jq >/dev/null 2>&1; then
+			echo "Существующий ZeroTier local.conf сохранен. Для безопасного объединения настроек нужен jq." >&2
+			return 1
+		fi
+		merged_conf="/tmp/zrs-local-conf-merged.$$"
+		jq ".settings = ((.settings // {}) + {secondaryPort: $ZT_SECONDARY_PORT, tertiaryPort: $ZT_TERTIARY_PORT})" "$current_local_conf" > "$merged_conf"
+		jq -e ".settings.secondaryPort == $ZT_SECONDARY_PORT and .settings.tertiaryPort == $ZT_TERTIARY_PORT" "$merged_conf" >/dev/null
+		if ! cmp -s "$merged_conf" "$current_local_conf"; then
+			[ -e "${current_local_conf}.zrs-before-transport" ] || cp -p "$current_local_conf" "${current_local_conf}.zrs-before-transport"
+			chmod --reference="$current_local_conf" "$merged_conf" 2>/dev/null || chmod 0600 "$merged_conf"
+			mv "$merged_conf" "$current_local_conf"
+		else
+			rm -f "$merged_conf"
+		fi
+	fi
+
+	uci set zerotier.global=zerotier
+	uci set zerotier.global.port=9993
+	uci set "zerotier.global.local_conf_path=${current_local_conf}"
+	uci commit zerotier
+
+	if [ "$nft_changed" = 1 ] && command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
+		if ! fw4 print > /tmp/zrs-fw4-candidate.nft || ! nft -c -f /tmp/zrs-fw4-candidate.nft; then
+			if [ -f "${nft_previous:-}" ]; then
+				mv "$nft_previous" "$ZT_BYPASS_FILE"
+			else
+				rm -f "$ZT_BYPASS_FILE"
+			fi
+			echo "Правило независимого транспорта ZeroTier не прошло проверку firewall." >&2
+			return 1
+		fi
+		rm -f "${nft_previous:-}"
+		/etc/init.d/firewall reload || /etc/init.d/firewall restart
+	fi
+
+	echo "Защита транспорта ZeroTier активна: UDP $ZT_PRIMARY_PORT/$ZT_SECONDARY_PORT/$ZT_TERTIARY_PORT обходят перехват Podkop."
 }
 
 ensure_firewall() {
@@ -78,7 +181,6 @@ configure_network() {
 	fi
 
 	pm_install_zerotier
-	ensure_firewall
 
 	uci set zerotier.global=zerotier
 	uci set zerotier.global.enabled='1'
@@ -90,7 +192,8 @@ configure_network() {
 	uci set "zerotier.${NETWORK_SECTION}.allow_global=0"
 	uci set "zerotier.${NETWORK_SECTION}.allow_default=0"
 	uci set "zerotier.${NETWORK_SECTION}.allow_dns=0"
-	uci commit zerotier
+	ensure_transport_independence
+	ensure_firewall
 
 	/etc/init.d/zerotier enable
 	/etc/init.d/zerotier restart
@@ -107,6 +210,7 @@ leave_network() {
 
 	uci -q delete "zerotier.${NETWORK_SECTION}" || true
 	uci commit zerotier
+	ensure_transport_independence
 	/etc/init.d/zerotier restart || true
 	status
 }
@@ -120,6 +224,7 @@ disable_service() {
 }
 
 restart_service() {
+	ensure_transport_independence
 	/etc/init.d/zerotier restart
 	sleep 5
 	status
@@ -256,6 +361,26 @@ collect_state() {
 
 	podkop_sources="$(uci -q get podkop.settings.source_network_interfaces 2>/dev/null || true)"
 	podkop_output="$(uci -q get podkop.settings.enable_output_network_interface 2>/dev/null || true)"
+	zt_transport_ports="$(current_zerotier_ports | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+	[ -n "$zt_transport_ports" ] || zt_transport_ports='-'
+	zt_bypass_active=0
+	[ -f "$ZT_BYPASS_FILE" ] && nft list chain inet fw4 podkop_zerotier_bypass >/dev/null 2>&1 && zt_bypass_active=1 || true
+	zt_ports_protected=0
+	if [ "$zt_transport_ports" != '-' ]; then
+		zt_ports_protected=1
+		zt_bypass_set="$(nft list set inet fw4 podkop_zerotier_udp_ports 2>/dev/null || true)"
+		for runtime_port in $zt_transport_ports; do
+			printf '%s\n' "$zt_bypass_set" | grep -Eq "(^|[,{[:space:]])${runtime_port}([,}[:space:]]|$)" || zt_ports_protected=0
+		done
+	fi
+	podkop_bypass_return=0
+	if ! nft list table inet PodkopTable >/dev/null 2>&1; then
+		podkop_bypass_return=1
+	elif nft list chain inet PodkopTable mangle_output 2>/dev/null | grep -q 'meta mark 0x00200000.*return'; then
+		podkop_bypass_return=1
+	fi
+	zt_transport_independent=0
+	[ "$zt_ports_protected" = 1 ] && [ "$zt_bypass_active" = 1 ] && [ "$podkop_bypass_return" = 1 ] && zt_transport_independent=1 || true
 }
 
 overall_state() {
@@ -348,6 +473,9 @@ print_friendly_report() {
 	echo "== Проверка podkop =="
 	printf 'Интерфейсы podkop source: %s\n' "$(value_or_dash "$podkop_sources")"
 	printf 'Маршрутизация исходящего трафика в podkop: %s\n' "$(yn "$podkop_output")"
+	printf 'Постоянные UDP-порты ZeroTier: %s\n' "$(value_or_dash "$zt_transport_ports")"
+	printf 'Обход перехвата Podkop активен: %s\n' "$(yn "$zt_bypass_active")"
+	printf 'ZeroTier независим от состояния Podkop: %s\n' "$(yn "$zt_transport_independent")"
 	if printf '%s\n' "$podkop_sources" | grep -Eq '(^|[[:space:]])zt'; then
 		echo "Оценка: внимание, ZeroTier попал в source interfaces podkop."
 	else
@@ -434,6 +562,7 @@ diagnose() {
 case "${1:-status}" in
 	install)
 		pm_install_zerotier
+		ensure_transport_independence
 		ensure_firewall
 		status
 		;;

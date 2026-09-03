@@ -33,11 +33,19 @@ ubus call system board 2>/dev/null || true
 echo "== Backup =="
 ts="$(date +%Y%m%d-%H%M%S)"
 backup_dir="/tmp/zt-support-backup-${ts}"
-mkdir -p "${backup_dir}/config"
+mkdir -p "${backup_dir}/config" "${backup_dir}/transport"
 sysupgrade -b "${backup_dir}/openwrt-config-before-zerotier-support-${ts}.tar.gz" >/dev/null
 for f in network firewall dropbear zerotier; do
 	[ -e "/etc/config/${f}" ] && cp "/etc/config/${f}" "${backup_dir}/config/${f}" || true
 done
+for f in /etc/zerotier-router-support.conf /etc/nftables.d/20-podkop-zerotier-bypass.nft; do
+	[ -e "$f" ] && cp -p "$f" "${backup_dir}/transport/$(basename "$f")" || true
+done
+existing_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
+if [ -n "$existing_local_conf" ] && [ -f "$existing_local_conf" ]; then
+	cp -p "$existing_local_conf" "${backup_dir}/transport/existing-local.conf"
+	printf '%s\n' "$existing_local_conf" > "${backup_dir}/transport/existing-local-conf-path"
+fi
 tar -czf "/tmp/zt-support-backup-${ts}.tar.gz" -C "${backup_dir}" .
 printf '%s\n' "/tmp/zt-support-backup-${ts}.tar.gz" > /tmp/zt-support-last-backup-path
 echo "BACKUP_FILE=/tmp/zt-support-backup-${ts}.tar.gz"
@@ -72,12 +80,16 @@ echo "LUCI_VIEW_DIR=$LUCI_VIEW_DIR"
 
 echo "== Install LuCI panel files =="
 cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/helper" "${HELPER_DIR}/helper"
+cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft" "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
+cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/zerotier-router-support.conf" "${HELPER_DIR}/zerotier-router-support.conf"
 cp "${OVERLAY_DIR}/usr/share/rpcd/ucode/zerotier.support" "${RPC_UCODE_DIR}/zerotier.support"
 cp "${OVERLAY_DIR}/usr/share/rpcd/acl.d/zerotier-support.json" "${RPC_ACL_DIR}/zerotier-support.json"
 cp "${OVERLAY_DIR}/usr/share/luci/menu.d/zerotier-support.json" "${LUCI_MENU_DIR}/zerotier-support.json"
 cp "${OVERLAY_DIR}/www/luci-static/resources/view/services/zerotier.js" "${LUCI_VIEW_DIR}/zerotier.js"
 
 chmod 0755 "${HELPER_DIR}/helper"
+chmod 0644 "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
+chmod 0600 "${HELPER_DIR}/zerotier-router-support.conf"
 chmod 0644 "${RPC_UCODE_DIR}/zerotier.support"
 chmod 0644 "${RPC_ACL_DIR}/zerotier-support.json"
 chmod 0644 "${LUCI_MENU_DIR}/zerotier-support.json"

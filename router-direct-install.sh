@@ -51,6 +51,8 @@ need_openwrt
 echo "== Загрузка установщика ZeroTier =="
 fetch_file "router-install.sh"
 fetch_file "openwrt/usr/libexec/zerotier-support/helper"
+fetch_file "openwrt/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
+fetch_file "openwrt/usr/libexec/zerotier-support/zerotier-router-support.conf"
 fetch_file "openwrt/usr/share/rpcd/ucode/zerotier.support"
 fetch_file "openwrt/usr/share/rpcd/acl.d/zerotier-support.json"
 fetch_file "openwrt/usr/share/luci/menu.d/zerotier-support.json"

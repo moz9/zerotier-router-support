@@ -9,6 +9,8 @@ KNOWN_HOSTS="${ZRS_KNOWN_HOSTS:-${HOME}/.ssh/known_hosts}"
 FILES=(
   "router-install.sh"
   "openwrt/usr/libexec/zerotier-support/helper"
+  "openwrt/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
+  "openwrt/usr/libexec/zerotier-support/zerotier-router-support.conf"
   "openwrt/usr/share/rpcd/ucode/zerotier.support"
   "openwrt/usr/share/rpcd/acl.d/zerotier-support.json"
   "openwrt/usr/share/luci/menu.d/zerotier-support.json"

@@ -18,6 +18,11 @@
   - global routes выключены;
   - default route override выключен;
   - DNS override выключен.
+- Независимый аварийный транспорт управления:
+  - постоянные UDP-порты `9993`, `25534`, `34923`;
+  - раннее nftables-правило выводит только пакеты ZeroTier из перехвата Podkop;
+  - правило сохраняется после перезагрузки роутера и `firewall reload`;
+  - ZeroTier продолжает работать при остановленном sing-box, сломанной подписке или DNS Podkop.
 
 ## Команды установки
 
@@ -69,6 +74,10 @@ ZT_NET="$(uci -q get zerotier.router_support.id || true)"
 /etc/init.d/zerotier disable 2>/dev/null || true
 
 uci -q delete zerotier.router_support || true
+if [ "$(uci -q get zerotier.global.local_conf_path || true)" = "/etc/zerotier-router-support.conf" ]; then
+  uci -q delete zerotier.global.local_conf_path || true
+  [ "$(uci -q get zerotier.global.port || true)" = "9993" ] && uci -q delete zerotier.global.port || true
+fi
 uci -q delete firewall.zt_support || true
 uci -q delete firewall.allow_zt_support_router || true
 uci commit zerotier 2>/dev/null || true
@@ -76,6 +85,10 @@ uci commit firewall 2>/dev/null || true
 
 rm -f \
   /usr/libexec/zerotier-support/helper \
+  /usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft \
+  /usr/libexec/zerotier-support/zerotier-router-support.conf \
+  /etc/nftables.d/20-podkop-zerotier-bypass.nft \
+  /etc/zerotier-router-support.conf \
   /usr/share/rpcd/ucode/zerotier.support \
   /usr/share/rpcd/acl.d/zerotier-support.json \
   /usr/share/luci/menu.d/zerotier-support.json \
@@ -175,6 +188,9 @@ ssh -i ~/.ssh/zerotier-router-support-ed25519 root@<ROUTER_ZEROTIER_IP> \
 Схема не должна мешать podkop:
 
 - ZeroTier-трафик создается самим роутером.
+- Его три фиксированных UDP-порта помечаются до выходной цепочки Podkop меткой штатного обхода `0x00200000`.
+- Адреса серверов и пиров ZeroTier не нужно добавлять в списки: защита не зависит от меняющихся IP и DNS.
+- При полном отсутствии Podkop эта метка безвредна и трафик идет по обычному WAN-маршруту.
 - LAN-клиенты не получают forwarding в ZeroTier по умолчанию.
 - Панель показывает source-интерфейсы podkop и output-routing, чтобы быстро заметить опасные изменения.
 

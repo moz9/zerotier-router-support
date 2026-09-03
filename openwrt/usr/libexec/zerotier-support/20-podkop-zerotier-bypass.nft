@@ -1,0 +1,9 @@
+set podkop_zerotier_udp_ports {
+	type inet_service
+	elements = { 9993, 25534, 34923 }
+}
+
+chain podkop_zerotier_bypass {
+	type route hook output priority -151; policy accept;
+	udp sport @podkop_zerotier_udp_ports meta mark set 0x00200000 counter comment "Keep ZeroTier outside Podkop"
+}
