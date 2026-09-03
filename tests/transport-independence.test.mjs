@@ -72,3 +72,64 @@ test("uninstall instructions remove only the support-owned transport files", () 
   assert.match(readme, /\/etc\/zerotier-router-support\.conf/);
   assert.doesNotMatch(readme, /rm -rf \/etc\/nftables\.d/);
 });
+
+test("the published one-liner is the universal install and update entrypoint", () => {
+  const readme = read("README.md");
+  const router = read("router-install.sh");
+
+  assert.match(readme, /универсальн[^\n]*установк[^\n]*обновлен/i);
+  assert.match(readme, /wget -qO- https:\/\/raw\.githubusercontent\.com\/moz9\/zerotier-router-support\/main\/router-direct-install\.sh \| sh/);
+  assert.match(router, /"\$\{HELPER_DIR\}\/helper" install/);
+});
+
+test("install automatically upgrades a running configured ZeroTier and verifies recovery", () => {
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+  const installCase = helper.match(/\n\s*install\)\n([\s\S]*?)\n\s*;;/)?.[1] ?? "";
+  const upgrade = helper.match(/install_or_upgrade\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+
+  assert.match(installCase, /install_or_upgrade/);
+  assert.match(upgrade, /snapshot_transport_state/);
+  assert.match(upgrade, /ensure_transport_independence/);
+  assert.match(upgrade, /transport_restart_required/);
+  assert.match(upgrade, /restart_and_verify_transport/);
+  assert.match(upgrade, /restore_transport_snapshot/);
+  assert.doesNotMatch(upgrade, /zerotier\.\$\{NETWORK_SECTION\}\.id/);
+});
+
+test("upgrade validates the existing virtual networks instead of replacing them", () => {
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+
+  assert.match(helper, /configured_network_ids\(\)/);
+  assert.match(helper, /wait_for_zerotier_ready\(\)/);
+  assert.match(helper, /zerotier-cli listnetworks -j/);
+  assert.match(helper, /status[^\n]*OK/);
+  assert.match(helper, /автоматический откат/i);
+});
+
+test("bypass reconciliation removes temporary random ports atomically after restart", () => {
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+
+  assert.match(helper, /sync_live_bypass_set\(\)/);
+  assert.match(helper, /flush set inet fw4 podkop_zerotier_udp_ports/);
+  assert.match(helper, /add element inet fw4 podkop_zerotier_udp_ports/);
+  assert.match(helper, /nft -f/);
+  assert.match(helper, /restart_and_verify_transport[\s\S]*ensure_transport_independence/);
+});
+
+test("critical firewall and restart failures are handled explicitly under BusyBox ash", () => {
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+
+  assert.match(helper, /if ! fw4 check; then[\s\S]*return 1/);
+  assert.match(helper, /if ! \/etc\/init\.d\/firewall reload[\s\S]*\/etc\/init\.d\/firewall restart/);
+  assert.match(helper, /if ! \/etc\/init\.d\/zerotier restart; then[\s\S]*return 1/);
+});
+
+test("status parses network names with spaces from JSON instead of fixed text columns", () => {
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+  const collect = helper.match(/collect_state\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+
+  assert.match(collect, /zerotier-cli listnetworks -j/);
+  assert.match(collect, /portDeviceName/);
+  assert.match(collect, /assignedAddresses/);
+  assert.doesNotMatch(collect, /network_status=.*awk '\{print \$6\}'/);
+});

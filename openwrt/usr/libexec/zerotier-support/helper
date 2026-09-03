@@ -11,6 +11,9 @@ ZT_SUPPORT_LOCAL_CONF="/etc/zerotier-router-support.conf"
 ZT_BYPASS_FILE="/etc/nftables.d/20-podkop-zerotier-bypass.nft"
 ZT_LOCAL_CONF_TEMPLATE="/usr/libexec/zerotier-support/zerotier-router-support.conf"
 ZT_BYPASS_TEMPLATE="/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
+ZT_UPGRADE_SNAPSHOT=""
+ZT_UPGRADE_NETWORK_IDS=""
+ZT_UPGRADE_WAS_READY="0"
 
 is_hex16() {
 	printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{16}$'
@@ -52,6 +55,48 @@ current_zerotier_ports() {
 	for expression in '@.config.settings.primaryPort' '@.config.settings.secondaryPort' '@.config.settings.tertiaryPort'; do
 		printf '%s\n' "$zt_json" | jsonfilter -e "$expression" 2>/dev/null || true
 	done
+}
+
+configured_network_ids() {
+	uci show zerotier 2>/dev/null | sed -n "s/^zerotier\.[^.]*\.id='\([0-9A-Fa-f]\{16\}\)'$/\1/p"
+}
+
+networks_are_ready() {
+	network_ids="${1:-}"
+	[ -n "$network_ids" ] || return 1
+	command -v jsonfilter >/dev/null 2>&1 || return 1
+	network_json="$(zerotier-cli listnetworks -j 2>/dev/null || true)"
+	[ -n "$network_json" ] || return 1
+	for network_id in $network_ids; do
+		network_status="$(printf '%s\n' "$network_json" | jsonfilter -e "@[@.id=\"${network_id}\"].status" 2>/dev/null || true)"
+		[ "$network_status" = "OK" ] || return 1
+	done
+	return 0
+}
+
+transport_ports_are_fixed() {
+	ports="$(current_zerotier_ports)"
+	[ "$(printf '%s\n' "$ports" | grep -Ec '^[0-9]+$')" = 3 ] || return 1
+	for expected_port in "$ZT_PRIMARY_PORT" "$ZT_SECONDARY_PORT" "$ZT_TERTIARY_PORT"; do
+		printf '%s\n' "$ports" | grep -qx "$expected_port" || return 1
+	done
+}
+
+sync_live_bypass_set() {
+	bypass_set_elements="$1"
+	command -v nft >/dev/null 2>&1 || return 0
+	nft list set inet fw4 podkop_zerotier_udp_ports >/dev/null 2>&1 || return 0
+	nft_batch="/tmp/zrs-bypass-live.$$"
+	cat > "$nft_batch" <<EOF
+flush set inet fw4 podkop_zerotier_udp_ports
+add element inet fw4 podkop_zerotier_udp_ports { $bypass_set_elements }
+EOF
+	if ! nft -c -f "$nft_batch" || ! nft -f "$nft_batch"; then
+		rm -f "$nft_batch"
+		echo "Не удалось синхронизировать активные порты обхода ZeroTier." >&2
+		return 1
+	fi
+	rm -f "$nft_batch"
 }
 
 ensure_transport_independence() {
@@ -132,7 +177,12 @@ ensure_transport_independence() {
 			return 1
 		fi
 		rm -f "${nft_previous:-}"
-		/etc/init.d/firewall reload || /etc/init.d/firewall restart
+		if ! /etc/init.d/firewall reload; then
+			/etc/init.d/firewall restart || return 1
+		fi
+	fi
+	if command -v nft >/dev/null 2>&1; then
+		sync_live_bypass_set "$bypass_elements" || return 1
 	fi
 
 	echo "Защита транспорта ZeroTier активна: UDP $ZT_PRIMARY_PORT/$ZT_SECONDARY_PORT/$ZT_TERTIARY_PORT обходят перехват Podkop."
@@ -165,11 +215,141 @@ ensure_firewall() {
 	uci set "firewall.${FW_RULE}.target=ACCEPT"
 
 	if command -v fw4 >/dev/null 2>&1; then
-		fw4 check
+		if ! fw4 check; then
+			echo "Настройки firewall не прошли проверку fw4." >&2
+			return 1
+		fi
 	fi
 
-	uci commit firewall
+	uci commit firewall || return 1
+	if ! /etc/init.d/firewall reload; then
+		/etc/init.d/firewall restart || return 1
+	fi
+	if [ -n "${bypass_elements:-}" ] && command -v nft >/dev/null 2>&1; then
+		sync_live_bypass_set "$bypass_elements" || return 1
+	fi
+}
+
+snapshot_transport_state() {
+	ZT_UPGRADE_SNAPSHOT="/tmp/zrs-transport-rollback.$$"
+	mkdir -p "$ZT_UPGRADE_SNAPSHOT"
+	cp -p /etc/config/zerotier "$ZT_UPGRADE_SNAPSHOT/zerotier.uci"
+	cp -p /etc/config/firewall "$ZT_UPGRADE_SNAPSHOT/firewall.uci"
+	old_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
+	printf '%s\n' "$old_local_conf" > "$ZT_UPGRADE_SNAPSHOT/local-conf-path"
+	if [ -n "$old_local_conf" ] && [ -f "$old_local_conf" ]; then
+		cp -p "$old_local_conf" "$ZT_UPGRADE_SNAPSHOT/local-conf"
+	fi
+	[ -f "$ZT_SUPPORT_LOCAL_CONF" ] && cp -p "$ZT_SUPPORT_LOCAL_CONF" "$ZT_UPGRADE_SNAPSHOT/support-local-conf" || true
+	[ -f "$ZT_BYPASS_FILE" ] && cp -p "$ZT_BYPASS_FILE" "$ZT_UPGRADE_SNAPSHOT/bypass.nft" || true
+
+	ZT_UPGRADE_NETWORK_IDS="$(configured_network_ids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+	ZT_UPGRADE_WAS_READY=0
+	if zerotier-cli info 2>/dev/null | grep -q ' ONLINE$' && networks_are_ready "$ZT_UPGRADE_NETWORK_IDS"; then
+		ZT_UPGRADE_WAS_READY=1
+	fi
+}
+
+restore_snapshot_file() {
+	backup_name="$1"
+	target_path="$2"
+	if [ -f "$ZT_UPGRADE_SNAPSHOT/$backup_name" ]; then
+		cp -p "$ZT_UPGRADE_SNAPSHOT/$backup_name" "$target_path"
+	else
+		rm -f "$target_path"
+	fi
+}
+
+restore_transport_snapshot() {
+	[ -n "$ZT_UPGRADE_SNAPSHOT" ] && [ -d "$ZT_UPGRADE_SNAPSHOT" ] || return 1
+	cp -p "$ZT_UPGRADE_SNAPSHOT/zerotier.uci" /etc/config/zerotier
+	cp -p "$ZT_UPGRADE_SNAPSHOT/firewall.uci" /etc/config/firewall
+	old_local_conf="$(cat "$ZT_UPGRADE_SNAPSHOT/local-conf-path")"
+	if [ -n "$old_local_conf" ] && [ -f "$ZT_UPGRADE_SNAPSHOT/local-conf" ]; then
+		cp -p "$ZT_UPGRADE_SNAPSHOT/local-conf" "$old_local_conf"
+	fi
+	restore_snapshot_file support-local-conf "$ZT_SUPPORT_LOCAL_CONF"
+	restore_snapshot_file bypass.nft "$ZT_BYPASS_FILE"
 	/etc/init.d/firewall reload || /etc/init.d/firewall restart
+}
+
+cleanup_transport_snapshot() {
+	[ -n "$ZT_UPGRADE_SNAPSHOT" ] && [ -d "$ZT_UPGRADE_SNAPSHOT" ] || return 0
+	rm -f "$ZT_UPGRADE_SNAPSHOT/zerotier.uci" \
+		"$ZT_UPGRADE_SNAPSHOT/firewall.uci" \
+		"$ZT_UPGRADE_SNAPSHOT/local-conf-path" \
+		"$ZT_UPGRADE_SNAPSHOT/local-conf" \
+		"$ZT_UPGRADE_SNAPSHOT/support-local-conf" \
+		"$ZT_UPGRADE_SNAPSHOT/bypass.nft"
+	rmdir "$ZT_UPGRADE_SNAPSHOT" 2>/dev/null || true
+	ZT_UPGRADE_SNAPSHOT=""
+}
+
+transport_restart_required() {
+	[ "$ZT_UPGRADE_WAS_READY" = 1 ] || return 1
+	[ "${ZRS_FORCE_ZEROTIER_RESTART:-0}" = 1 ] && return 0
+	transport_ports_are_fixed && return 1
+	return 0
+}
+
+wait_for_zerotier_ready() {
+	wait_attempt=0
+	while [ "$wait_attempt" -lt 45 ]; do
+		if zerotier-cli info 2>/dev/null | grep -q ' ONLINE$' && networks_are_ready "$ZT_UPGRADE_NETWORK_IDS"; then
+			return 0
+		fi
+		wait_attempt=$((wait_attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+restart_and_verify_transport() {
+	if ! /etc/init.d/zerotier restart; then
+		echo "Служба ZeroTier не перезапустилась; требуется автоматический откат." >&2
+		return 1
+	fi
+	if ! wait_for_zerotier_ready; then
+		echo "ZeroTier не вернулся в исходные виртуальные сети; требуется автоматический откат." >&2
+		return 1
+	fi
+	if ! transport_ports_are_fixed; then
+		echo "ZeroTier вернулся, но постоянные порты не применились; требуется автоматический откат." >&2
+		return 1
+	fi
+	ensure_transport_independence || return 1
+	wait_for_zerotier_ready
+}
+
+install_or_upgrade() {
+	pm_install_zerotier
+	snapshot_transport_state
+	if ! ensure_transport_independence || ! ensure_firewall; then
+		echo "Обновление не применилось; выполняется автоматический откат." >&2
+		restore_transport_snapshot || true
+		cleanup_transport_snapshot
+		return 1
+	fi
+
+	if transport_restart_required; then
+		echo "Применяю обновление ZeroTier без перезагрузки роутера..."
+		if ! restart_and_verify_transport; then
+			echo "Восстанавливаю прежний транспорт и существующие виртуальные сети." >&2
+			restore_transport_snapshot || true
+			/etc/init.d/zerotier restart || true
+			wait_for_zerotier_ready || true
+			cleanup_transport_snapshot
+			return 1
+		fi
+		echo "ZeroTier вернулся в существующие виртуальные сети; обновление завершено."
+	elif [ "$ZT_UPGRADE_WAS_READY" = 1 ]; then
+		echo "ZeroTier уже использует защищенные постоянные порты; перезапуск не требуется."
+	else
+		echo "Настройки установлены без перезапуска: активной готовой сети ZeroTier до обновления не было."
+	fi
+
+	cleanup_transport_snapshot
+	status
 }
 
 configure_network() {
@@ -288,12 +468,12 @@ collect_state() {
 	zt_running=0
 	zt_info=''
 	zt_networks=''
+	zt_networks_json=''
 	zt_peers=''
 	zt_node='-'
 	zt_version='-'
 	zt_state='-'
 	network_id="$(uci -q get "zerotier.${NETWORK_SECTION}.id" 2>/dev/null || true)"
-	network_line=''
 	network_name='-'
 	network_status='-'
 	network_type='-'
@@ -309,6 +489,7 @@ collect_state() {
 	if [ "$zt_installed" = 1 ]; then
 		zt_info="$(zerotier-cli info 2>&1 || true)"
 		zt_networks="$(zerotier-cli listnetworks 2>&1 || true)"
+		zt_networks_json="$(zerotier-cli listnetworks -j 2>/dev/null || true)"
 		zt_peers="$(zerotier-cli listpeers 2>&1 || true)"
 
 		zt_node="$(printf '%s\n' "$zt_info" | awk '/^200 info / {print $3; exit}')"
@@ -318,19 +499,21 @@ collect_state() {
 		[ -n "$zt_version" ] || zt_version='-'
 		[ -n "$zt_state" ] || zt_state='-'
 
-		if [ -n "$network_id" ]; then
-			network_line="$(printf '%s\n' "$zt_networks" | awk -v id="$network_id" '$2 == "listnetworks" && $3 == id {print; exit}')"
-		else
-			network_line="$(printf '%s\n' "$zt_networks" | awk '$2 == "listnetworks" && $3 != "<nwid>" {print; exit}')"
+		if [ -z "$network_id" ] && [ -n "$zt_networks_json" ]; then
+			network_id="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e '@[0].id' 2>/dev/null || true)"
 		fi
 
-		if [ -n "$network_line" ]; then
-			network_id="$(printf '%s\n' "$network_line" | awk '{print $3}')"
-			network_name="$(printf '%s\n' "$network_line" | awk '{print $4}')"
-			network_status="$(printf '%s\n' "$network_line" | awk '{print $6}')"
-			network_type="$(printf '%s\n' "$network_line" | awk '{print $7}')"
-			zt_device="$(printf '%s\n' "$network_line" | awk '{print $8}')"
-			zt_ips="$(printf '%s\n' "$network_line" | awk '{for (i=9; i<=NF; i++) printf "%s%s", (i==9 ? "" : " "), $i}')"
+		if [ -n "$network_id" ] && [ -n "$zt_networks_json" ]; then
+			network_json_path="@[@.id=\"${network_id}\"]"
+			network_name="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e "${network_json_path}.name" 2>/dev/null || true)"
+			network_status="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e "${network_json_path}.status" 2>/dev/null || true)"
+			network_type="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e "${network_json_path}.type" 2>/dev/null || true)"
+			zt_device="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e "${network_json_path}.portDeviceName" 2>/dev/null || true)"
+			zt_ips="$(printf '%s\n' "$zt_networks_json" | jsonfilter -e "${network_json_path}.assignedAddresses[*]" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+			[ -n "$network_name" ] || network_name='-'
+			[ -n "$network_status" ] || network_status='-'
+			[ -n "$network_type" ] || network_type='-'
+			[ -n "$zt_device" ] || zt_device='-'
 			[ -n "$zt_ips" ] || zt_ips='-'
 		fi
 
@@ -561,10 +744,7 @@ diagnose() {
 
 case "${1:-status}" in
 	install)
-		pm_install_zerotier
-		ensure_transport_independence
-		ensure_firewall
-		status
+		install_or_upgrade
 		;;
 	configure)
 		configure_network "${2:-}"

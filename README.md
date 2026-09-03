@@ -24,11 +24,11 @@
   - правило сохраняется после перезагрузки роутера и `firewall reload`;
   - ZeroTier продолжает работать при остановленном sing-box, сломанной подписке или DNS Podkop.
 
-## Команды установки
+## Универсальная установка и обновление
 
 ### Быстрый вариант прямо на OpenWrt
 
-Подключитесь к роутеру по SSH и выполните:
+Одна и та же команда используется и для первой установки, и для обновления уже настроенного роутера:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
@@ -40,7 +40,9 @@ wget -qO- https://raw.githubusercontent.com/moz9/zerotier-router-support/main/ro
 curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/router-direct-install.sh | sh
 ```
 
-После установки откройте LuCI: **Службы -> ZeroTier**, введите Network ID и авторизуйте роутер в ZeroTier Central.
+Скрипт сам определяет `apk` или `opkg`, сохраняет существующие Network ID и параметры сети. При обновлении он заранее защищает текущие UDP-порты, при необходимости кратко перезапускает только ZeroTier, проверяет возврат существующих виртуальных сетей и автоматически откатывает транспорт при ошибке. Роутер не перезагружается.
+
+При первой установке после выполнения команды откройте LuCI: **Службы -> ZeroTier**, введите Network ID и авторизуйте роутер в ZeroTier Central.
 
 ### С Mac на роутер по SSH
 
