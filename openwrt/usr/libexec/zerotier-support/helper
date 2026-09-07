@@ -15,6 +15,16 @@ ZT_UPGRADE_SNAPSHOT=""
 ZT_UPGRADE_NETWORK_IDS=""
 ZT_UPGRADE_WAS_READY="0"
 
+merge_local_conf() {
+	jq --arg warp "$2" --argjson secondary "$ZT_SECONDARY_PORT" --argjson tertiary "$ZT_TERTIARY_PORT" '
+		if type != "object" or ((.settings // {}) | type) != "object" then error("Invalid local.conf") else . end |
+		.settings = ((.settings // {}) + {secondaryPort: $secondary, tertiaryPort: $tertiary}) |
+		if $warp == "" then . else
+		  if ((.settings.interfacePrefixBlacklist // []) | type) != "array" then error("Invalid interface blacklist") else . end |
+		  .settings.interfacePrefixBlacklist = ((.settings.interfacePrefixBlacklist // []) + [$warp] | unique)
+		end' "$1"
+}
+
 is_hex16() {
 	printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{16}$'
 }
@@ -133,14 +143,14 @@ ensure_transport_independence() {
 	rm -f "$nft_candidate"
 
 	current_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
-	if [ -z "$current_local_conf" ] || [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ]; then
-		if [ ! -f "$ZT_SUPPORT_LOCAL_CONF" ] || ! cmp -s "$ZT_LOCAL_CONF_TEMPLATE" "$ZT_SUPPORT_LOCAL_CONF"; then
+	[ -n "$current_local_conf" ] || current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
+	if [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ] && [ ! -f "$current_local_conf" ]; then
 			cp "$ZT_LOCAL_CONF_TEMPLATE" "${ZT_SUPPORT_LOCAL_CONF}.new"
 			chmod 0600 "${ZT_SUPPORT_LOCAL_CONF}.new"
 			mv "${ZT_SUPPORT_LOCAL_CONF}.new" "$ZT_SUPPORT_LOCAL_CONF"
-		fi
-		current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
-	else
+	fi
+	# Merge even our own configuration: it may contain user exclusions and keys.
+	if ! cmp -s "$ZT_LOCAL_CONF_TEMPLATE" "$current_local_conf" || command -v jq >/dev/null 2>&1; then
 		if [ ! -f "$current_local_conf" ]; then
 			echo "Указанный ZeroTier local.conf не найден: $current_local_conf" >&2
 			return 1
@@ -150,8 +160,16 @@ ensure_transport_independence() {
 			return 1
 		fi
 		merged_conf="/tmp/zrs-local-conf-merged.$$"
-		jq ".settings = ((.settings // {}) + {secondaryPort: $ZT_SECONDARY_PORT, tertiaryPort: $ZT_TERTIARY_PORT})" "$current_local_conf" > "$merged_conf"
-		jq -e ".settings.secondaryPort == $ZT_SECONDARY_PORT and .settings.tertiaryPort == $ZT_TERTIARY_PORT" "$merged_conf" >/dev/null
+		warp_interface="$(uci -q get warp.main.actual_interface 2>/dev/null || true)"
+		if ! printf '%s' "$warp_interface" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,14}$' ||
+			[ "$(uci -q get "network.$warp_interface.warp_managed" 2>/dev/null || true)" != luci-app-warp ]; then
+			warp_interface=''
+		fi
+		if ! merge_local_conf "$current_local_conf" "$warp_interface" > "$merged_conf"; then
+			rm -f "$merged_conf"
+			return 1
+		fi
+		jq -e ".settings.secondaryPort == $ZT_SECONDARY_PORT and .settings.tertiaryPort == $ZT_TERTIARY_PORT" "$merged_conf" >/dev/null || return 1
 		if ! cmp -s "$merged_conf" "$current_local_conf"; then
 			[ -e "${current_local_conf}.zrs-before-transport" ] || cp -p "$current_local_conf" "${current_local_conf}.zrs-before-transport"
 			chmod --reference="$current_local_conf" "$merged_conf" 2>/dev/null || chmod 0600 "$merged_conf"
