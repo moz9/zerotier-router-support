@@ -10,7 +10,8 @@
 - Страница LuCI: **Службы -> ZeroTier**.
 - Отдельный SSH-ключ поддержки, созданный локально на вашем компьютере.
 - Отдельная firewall-зона для ZeroTier:
-  - разрешены только TCP-порты `22`, `80`, `443` к самому роутеру;
+  - разрешены TCP-порты `22`, `80`, `443` и IPv4 ping (ICMP echo-request) к самому роутеру;
+  - ping разрешён только из зоны ZeroTier; вход с WAN не расширяется;
   - forwarding из ZeroTier в LAN/WAN выключен;
   - SSH в интернет через WAN не открывается.
 - Безопасные настройки ZeroTier:
@@ -82,6 +83,7 @@ if [ "$(uci -q get zerotier.global.local_conf_path || true)" = "/etc/zerotier-ro
 fi
 uci -q delete firewall.zt_support || true
 uci -q delete firewall.allow_zt_support_router || true
+uci -q delete firewall.allow_zt_support_ping || true
 uci commit zerotier 2>/dev/null || true
 uci commit firewall 2>/dev/null || true
 

@@ -206,6 +206,20 @@ ensure_transport_independence() {
 	echo "Защита транспорта ZeroTier активна: UDP $ZT_PRIMARY_PORT/$ZT_SECONDARY_PORT/$ZT_TERTIARY_PORT обходят перехват Podkop."
 }
 
+ensure_ping_rule() {
+	# Dedicated input exception: ping to this router over ZeroTier only.
+	# Named section makes both installation and repeated upgrades idempotent.
+	uci -q delete firewall.allow_zt_support_ping || true
+	uci set firewall.allow_zt_support_ping=rule || return 1
+	uci set firewall.allow_zt_support_ping.name=Allow-ZeroTier-Ping-To-Router || return 1
+	uci set "firewall.allow_zt_support_ping.src=${FW_ZONE}" || return 1
+	uci set firewall.allow_zt_support_ping.proto=icmp || return 1
+	uci set firewall.allow_zt_support_ping.icmp_type=echo-request || return 1
+	uci set firewall.allow_zt_support_ping.family=ipv4 || return 1
+	uci set firewall.allow_zt_support_ping.target=ACCEPT || return 1
+	uci set firewall.allow_zt_support_ping.enabled=1 || return 1
+}
+
 ensure_firewall() {
 	if ! uci -q get "firewall.${FW_ZONE}" >/dev/null; then
 		uci set "firewall.${FW_ZONE}=zone"
@@ -231,6 +245,7 @@ ensure_firewall() {
 	uci add_list "firewall.${FW_RULE}.dest_port=80"
 	uci add_list "firewall.${FW_RULE}.dest_port=443"
 	uci set "firewall.${FW_RULE}.target=ACCEPT"
+	ensure_ping_rule || return 1
 
 	if command -v fw4 >/dev/null 2>&1; then
 		if ! fw4 check; then
