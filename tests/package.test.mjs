@@ -45,6 +45,9 @@ test('the guard is installed so that an interrupted install cannot leave it half
   const put = (what) => router.indexOf(what);
   assert.ok(put('mv "${HELPER_DIR}/guard.new" "${HELPER_DIR}/guard"') > 0, 'the guard is not put in place by a rename');
   assert.ok(put('mv "${GUARD_INIT}.new" "$GUARD_INIT"') > put('mv "${HELPER_DIR}/guard.new" "${HELPER_DIR}/guard"'), 'the service script must come after the program');
-  assert.ok(put('"$GUARD_INIT" enable') > put('"${HELPER_DIR}/helper" install'), 'the service is switched on only after the rest succeeded');
+  assert.ok(put('"$GUARD_INIT" enable') > put('"${HELPER_DIR}/helper.new" install'), 'the service is switched on only after the rest succeeded');
+  // the old helper stays until the very end: a tool comparing checksums still offers the update after a half-way stop
+  assert.ok(put('mv "${HELPER_DIR}/helper.new" "${HELPER_DIR}/helper"') > put('"$GUARD_INIT" enable'), 'the new helper must be put in place last');
+  assert.equal(router.match(/cp "\$\{OVERLAY_DIR\}\/usr\/libexec\/zerotier-support\/helper" "([^"]+)"/)?.[1], '${HELPER_DIR}/helper.new', 'the new helper is staged, not copied over the old one');
   assert.match(read('openwrt/etc/init.d/zerotier-guard'), /\[ -x "\$GUARD" \] \|\| return 0/);
 });

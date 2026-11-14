@@ -75,6 +75,8 @@ lab_up() {
 
 # Run a command inside a node's namespace and the given root, with the node's state at the router's own paths:
 #   $N/<node>/home  -> /var/lib/zerotier-one       (RAM on a router)
+#   $N/<node>/varlib -> /var/lib, instead of home, when the directory exists: a start-up script that replaces
+#                       /var/lib/zerotier-one with a link of its own (a vendor firmware) needs the directory above it
 #   $N/<node>/flash -> /etc/zerotier-support       (flash on a router), when the directory exists
 #   $N/<node>/ram   -> /tmp/zerotier-support
 #   $N/<node>/over/<path> is put over the root's own <path> (single files: stand-ins for procd, reboot, ...)
@@ -87,8 +89,9 @@ lab_in() {  # <node> <root: 24.10|25.12> <ash command>
 		mount --make-rprivate /
 		mount -t proc proc "$R/proc"
 		mount -t tmpfs -o size=32m tmpfs "$R/tmp"
-		mkdir -p "$R/tmp/lib/zerotier-one" "$R/tmp/lock" "$R/tmp/run" "$R/tmp/state" "$R/tmp/log" "$R/tmp/zerotier-support"
-		mount --bind "$D/home" "$R/tmp/lib/zerotier-one"
+		mkdir -p "$R/tmp/lib" "$R/tmp/lock" "$R/tmp/run" "$R/tmp/state" "$R/tmp/log" "$R/tmp/zerotier-support"
+		if [ -d "$D/varlib" ]; then mount --bind "$D/varlib" "$R/tmp/lib"
+		else mkdir -p "$R/tmp/lib/zerotier-one"; mount --bind "$D/home" "$R/tmp/lib/zerotier-one"; fi
 		[ -d "$D/ram" ] && mount --bind "$D/ram" "$R/tmp/zerotier-support"
 		[ -d "$D/tmp" ] && { mkdir -p "$R/tmp/lab"; mount --bind "$D/tmp" "$R/tmp/lab"; }
 		if [ -d "$D/flash" ]; then mkdir -p "$R/etc/zerotier-support"; mount --bind "$D/flash" "$R/etc/zerotier-support"; fi

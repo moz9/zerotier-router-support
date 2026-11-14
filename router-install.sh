@@ -95,7 +95,10 @@ echo "LUCI_MENU_DIR=$LUCI_MENU_DIR"
 echo "LUCI_VIEW_DIR=$LUCI_VIEW_DIR"
 
 echo "== Install LuCI panel files =="
-cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/helper" "${HELPER_DIR}/helper"
+# The new helper runs the install from helper.new and replaces the old one only at the very end, after everything
+# has succeeded: a management tool that compares the helper's checksum with the published one then still offers the
+# update when an install stopped half-way (the other files are already new by then).
+cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/helper" "${HELPER_DIR}/helper.new"
 cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft" "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
 cp "${OVERLAY_DIR}/usr/libexec/zerotier-support/zerotier-router-support.conf" "${HELPER_DIR}/zerotier-router-support.conf"
 cp "${OVERLAY_DIR}/usr/share/rpcd/ucode/zerotier.support" "${RPC_UCODE_DIR}/zerotier.support"
@@ -121,7 +124,7 @@ if [ -f "$GUARD_SRC" ] && [ -f "${OVERLAY_DIR}/etc/init.d/zerotier-guard" ] && [
 	mv "${GUARD_INIT}.new" "$GUARD_INIT"
 fi
 
-chmod 0755 "${HELPER_DIR}/helper"
+chmod 0755 "${HELPER_DIR}/helper.new"
 chmod 0644 "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
 chmod 0600 "${HELPER_DIR}/zerotier-router-support.conf"
 chmod 0644 "${RPC_UCODE_DIR}/zerotier.support"
@@ -147,7 +150,7 @@ else
 fi
 
 echo "== Prepare firewall =="
-"${HELPER_DIR}/helper" install
+"${HELPER_DIR}/helper.new" install
 
 if [ -x "${HELPER_DIR}/guard" ] && [ -x "$GUARD_INIT" ]; then
 	echo "== Access guard =="
@@ -162,6 +165,7 @@ if [ -x "${HELPER_DIR}/guard" ] && [ -x "$GUARD_INIT" ]; then
 		echo "Сторож доступа установлен, но выключен (ZRS_GUARD=0)."
 	fi
 fi
+mv "${HELPER_DIR}/helper.new" "${HELPER_DIR}/helper"
 
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
 /etc/init.d/rpcd restart

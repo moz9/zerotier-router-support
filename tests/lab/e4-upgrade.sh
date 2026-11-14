@@ -121,6 +121,7 @@ rc=$(upgrade)
 say "state after the kill: $(state)"
 check "U3 the run ended with an error (exit $rc)" test "$rc" != 0
 check "U3 the guard is not switched on by a half-finished install" test "$(ls "$RU/etc/rc.d" | grep -c zerotier-guard)" = 0
+check "U3 a checksum-comparing tool still offers the update (the old helper is in place)" test "$(tool_says "$N/A/tmp/www")" = update
 check "U3 ZeroTier was not touched: same process, same settings" test "$(zt_pid)" = "$PID0" -a "$(sha "$RU/etc/config/zerotier")" = "$UCI0"
 lab_ping_from_b "$A_IP" && ok "U3 the router is still reachable" || bad "U3 the router is not reachable after the kill"
 

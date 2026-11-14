@@ -16,7 +16,7 @@
 # BusyBox ash, OpenWrt 24.10 (opkg) and 25.12 (apk). No timeout, stat or fractional sleep there.
 set -u
 
-GUARD_VERSION="2026.11.14"                   # the support package's version (same as in the helper)
+GUARD_VERSION="2026.11.15"                   # the support package's version (same as in the helper)
 R="${ZRS_GUARD_ROOT:-}"                      # tests only: a prefix for every absolute path
 FLASH="$R/etc/zerotier-support"
 RAM="$R/tmp/zerotier-support"
@@ -178,14 +178,23 @@ flush_incident() {  # [force]
 }
 
 # ---------------------------------------------------------------- what is configured
+# Switched on: a section of type zerotier with enabled=1 ("global" in the stock package; vendor scripts name theirs
+# as they like) and the service enabled.
 zt_enabled() {
 	have zerotier-cli && have jsonfilter || return 1
 	[ -x "$INITD/zerotier" ] || return 1
-	[ "$(uci -q get zerotier.global.enabled 2>/dev/null)" = 1 ] || return 1
+	ze_show="$(uci -q show zerotier 2>/dev/null)"
+	ze_on=''
+	for ze_s in $(printf '%s\n' "$ze_show" | sed -n 's/^zerotier\.\([^.=]*\)=zerotier$/\1/p'); do
+		printf '%s\n' "$ze_show" | grep -qx "zerotier\.$ze_s\.enabled='1'" && ze_on=1
+	done
+	[ -n "$ze_on" ] || return 1
 	"$INITD/zerotier" enabled >/dev/null 2>&1 || return 1
 }
+# "option id" of the stock package's network sections and "list join" of vendor scripts
 network_ids() {
-	uci -q show zerotier 2>/dev/null | sed -n "s/^zerotier\.[^.]*\.id='\([0-9A-Fa-f]\{16\}\)'\$/\1/p" | tr 'A-F' 'a-f'
+	uci -q show zerotier 2>/dev/null | sed -n -E "s/^zerotier\.[^.]*\.(id|join)=(.*)\$/\2/p" | tr -c '0-9A-Fa-f\n' ' ' |
+		tr ' ' '\n' | grep -E '^[0-9A-Fa-f]{16}$' | tr 'A-F' 'a-f' | sort -u
 }
 network_managed() {  # <id>: 0 when this network's addresses are switched off in the settings
 	nm_sec="$(uci -q show zerotier 2>/dev/null | sed -n "s/^zerotier\.\([^.]*\)\.id='$1'\$/\1/p" | head -n 1)"
@@ -315,7 +324,7 @@ busy_reason() {
 	if have pgrep; then
 		pgrep -f 'sysupgrade|/lib/upgrade/|/sbin/upgraded' >/dev/null 2>&1 && { echo 'firmware upgrade'; return; }
 		{ pgrep -x apk >/dev/null 2>&1 || pgrep -x opkg >/dev/null 2>&1; } && { echo 'package install'; return; }
-		pgrep -f 'podkop-pe|podkop-install|podkop-uninstall|router-install\.sh|zerotier-support/helper (install|configure|leave|restart|disable)' >/dev/null 2>&1 &&
+		pgrep -f 'podkop-pe|podkop-install|podkop-uninstall|router-install\.sh|zerotier-support/helper(\.new)? (install|configure|leave|restart|disable)' >/dev/null 2>&1 &&
 			{ echo 'installer'; return; }
 	fi
 	for br_f in "$R"/tmp/sysupgrade.* "$R/tmp/firmware.bin"; do
@@ -391,25 +400,47 @@ cache_drop() {  # <id>: the controller refused this node; its old settings must 
 	[ -e "$(cache_path "$1")" ] || return 0
 	rm -f "$(cache_path "$1")" && log "kept network settings removed: the controller refuses this node in network …$(printf '%s' "$1" | cut -c13-16)"
 }
-# Put the kept settings where the daemon reads them at start and let procd start the daemon again
-# (procd runs only the program then; the init script, which empties the directory, is not involved).
-# Does procd start the daemon again by itself after it exits? (The stock start-up script asks for that; one
-# router of the fleet has a script that does not.)
+# Does procd start the daemon again by itself after it exits? The stock start-up script asks for that. Some vendor
+# scripts (RouteRich, for one) do not, keep ZeroTier's home on flash and, in their "stop", delete the networks'
+# settings and reload the firewall: there the daemon alone is stopped and the script's "start" brings it back.
 procd_respawns() {
 	ubus call service list '{"name":"zerotier"}' 2>/dev/null | jsonfilter -e '@.zerotier.instances.*.respawn.retry' 2>/dev/null | grep -q .
 }
-seed_possible() {  # a network that waits for settings has a whole kept copy, and procd will start the daemon again
-	for sp_id in $H_NOCFG; do cache_valid "$sp_id" && { procd_respawns; return $?; }; done
+init_respawns() { grep -v '^[[:space:]]*#' "$INITD/zerotier" 2>/dev/null | grep -q 'procd_set_param respawn'; }
+# ZeroTier's home lies outside RAM (a vendor script links it to flash): its "start" does not empty it
+home_on_flash() {
+	hf="$(readlink -f "$ZT_HOME" 2>/dev/null)"
+	[ -z "$R" ] || hf="${hf#"$(readlink -f "$R" 2>/dev/null)"}"
+	case "$hf" in ''|/tmp|/tmp/*|/var|/var/*) return 1 ;; esac
+	return 0
+}
+zt_start() {  # <restart|start>: (re)start the daemon the way this router's start-up script allows
+	if init_respawns; then "$INITD/zerotier" "$1" >/dev/null 2>&1; return $?; fi
+	zs_p="$(pidof zerotier-one 2>/dev/null | awk '{print $1}')"
+	if [ -n "$zs_p" ]; then
+		kill "$zs_p" 2>/dev/null
+		zs_i=0
+		while kill -0 "$zs_p" 2>/dev/null && [ "$zs_i" -lt 10 ]; do sleep 1; zs_i=$(( zs_i + 1 )); done
+		kill -9 "$zs_p" 2>/dev/null
+	fi
+	"$INITD/zerotier" start >/dev/null 2>&1
+}
+# Kept settings can be put back where the daemon reads them at start when procd starts the daemon again by itself
+# (procd runs only the program then; the stock script, which empties the directory, is not involved), or when the
+# home is on flash and the vendor script's "start" leaves it as it is.
+seed_way() { procd_respawns || { ! init_respawns && home_on_flash; }; }
+seed_possible() {  # a network that waits for settings has a whole kept copy, and the daemon can be started on it
+	for sp_id in $H_NOCFG; do cache_valid "$sp_id" && { seed_way; return $?; }; done
 	return 1
 }
-can_seed() {  # every network that is fine now has a whole kept copy, and procd will start the daemon again
+can_seed() {  # every network that is fine now has a whole kept copy, and the daemon can be started on it
 	[ "$CACHE" = 1 ] && [ -n "$H_OK_IDS" ] || return 1
 	for cn_id in $H_OK_IDS; do cache_valid "$cn_id" || return 1; done
-	procd_respawns
+	seed_way
 }
 seed() {
-	if ! procd_respawns; then
-		[ "$S_NORESPAWN" = 1 ] || log "kept network settings cannot be put back here: this router's ZeroTier service is not started again by the system (no respawn in its start-up script)"
+	if ! seed_way; then
+		[ "$S_NORESPAWN" = 1 ] || log "kept network settings cannot be put back here: this router's ZeroTier service is not started again by the system and its home is in RAM"
 		S_NORESPAWN=1
 		return 1
 	fi
@@ -424,6 +455,22 @@ seed() {
 	[ -n "$sd_ok" ] || return 1
 	S_SEEDS=$(( S_SEEDS + 1 )); add_step 'kept-settings'
 	log "controller does not answer: kept network settings put back, daemon restarting (pid $H_PID)"
+	if ! procd_respawns; then
+		# the home is on flash: the daemon alone is stopped and the start-up script's "start" brings it back
+		zt_start start || log "the ZeroTier init script returned an error"
+		sd_i=0; sd_new=''
+		while [ "$sd_i" -lt 30 ]; do
+			sd_new="$(pidof zerotier-one 2>/dev/null | awk '{print $1}')"
+			[ -n "$sd_new" ] && [ "$sd_new" != "$H_PID" ] && break
+			sd_new=''; sleep 1; sd_i=$(( sd_i + 1 ))
+		done
+		for sd_id in $H_NOCFG; do   # the script may touch the file it finds; "ours" is what is there now
+			[ -s "$(ram_conf "$sd_id")" ] && S_SEED_M="$(num "$(date -r "$(ram_conf "$sd_id")" +%s 2>/dev/null)")" && break
+		done
+		if [ -z "$sd_new" ]; then log "the daemon did not come back after the kept settings were put back"; S_SEED_PID=''; return 0; fi
+		S_SEED_PID="$sd_new"; S_PID="$sd_new"; S_PID_SINCE=$UP
+		return 0
+	fi
 	kill "$H_PID" 2>/dev/null
 	sd_i=0; sd_new=''
 	while [ "$sd_i" -lt 30 ]; do
@@ -450,13 +497,14 @@ do_restart() {  # <why>
 	S_NEXT_RESTART=$(( UP + dr_gap ))
 	S_SEED_PID=''; S_NOCFG_SINCE=0
 	log "step: restart ZeroTier (#$S_RESTARTS, $1); next restart not before ${dr_gap}s"
-	"$INITD/zerotier" restart >/dev/null 2>&1 || log "the ZeroTier init script returned an error"
+	zt_start restart || log "the ZeroTier init script returned an error"
 	mark_started
 }
 do_dead_start() {
 	[ "$UP" -ge "$S_DEAD_NEXT" ] || return 0
 	# procd restarts a crashed daemon by itself after five seconds, five times an hour: give it the first go
-	if [ "$S_DEAD_N" = 0 ] && [ -z "${ZRS_GUARD_NO_WAIT:-}" ]; then
+	# (where the start-up script asks for that)
+	if [ "$S_DEAD_N" = 0 ] && [ -z "${ZRS_GUARD_NO_WAIT:-}" ] && init_respawns; then
 		sleep 10
 		[ -n "$(pidof zerotier-one 2>/dev/null)" ] && { log "daemon was down, procd brought it back"; return 0; }
 	fi
@@ -467,7 +515,7 @@ do_dead_start() {
 	S_DEAD_NEXT=$(( UP + dd_gap ))
 	S_SEED_PID=''; S_NOCFG_SINCE=0
 	log "step: the ZeroTier daemon is not running, starting it (#$S_DEAD_N); next try not before ${dd_gap}s"
-	"$INITD/zerotier" restart >/dev/null 2>&1 || log "the ZeroTier init script returned an error"
+	zt_start restart || log "the ZeroTier init script returned an error"
 	mark_started
 }
 runtime_ports() {

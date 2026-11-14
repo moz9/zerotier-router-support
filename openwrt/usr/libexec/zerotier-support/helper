@@ -3,7 +3,7 @@ set -eu
 
 # The version of the whole support package. It changes with every release, so the helper's checksum does too:
 # A management tool that compares the files on a router with the published ones then sees an update.
-ZRS_VERSION="2026.11.14"
+ZRS_VERSION="2026.11.15"
 NETWORK_SECTION="router_support"
 FW_ZONE="zt_support"
 FW_RULE="allow_zt_support_router"
@@ -16,6 +16,7 @@ ZT_LOCAL_CONF_TEMPLATE="/usr/libexec/zerotier-support/zerotier-router-support.co
 ZT_BYPASS_TEMPLATE="/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
 ZT_UPGRADE_SNAPSHOT=""
 ZT_UPGRADE_NETWORK_IDS=""
+ZT_INIT="/etc/init.d/zerotier"
 ZT_UPGRADE_WAS_READY="0"
 
 merge_local_conf() {
@@ -71,7 +72,70 @@ current_zerotier_ports() {
 }
 
 configured_network_ids() {
-	uci show zerotier 2>/dev/null | sed -n "s/^zerotier\.[^.]*\.id='\([0-9A-Fa-f]\{16\}\)'$/\1/p"
+	# "option id" of the stock package, and "list join" of vendor scripts that start ZeroTier their own way
+	uci show zerotier 2>/dev/null | sed -n -E "s/^zerotier\.[^.]*\.(id|join)=(.*)$/\2/p" | tr -c '0-9A-Fa-f\n' ' ' |
+		tr ' ' '\n' | grep -E '^[0-9A-Fa-f]{16}$' | tr 'A-F' 'a-f' | sort -u || true
+}
+
+# How this firmware starts ZeroTier. The stock OpenWrt script keeps ZeroTier's home in RAM, links local.conf from
+# the uci option local_conf_path and asks procd to restart the program. Some vendor firmwares (RouteRich, for one)
+# keep the home on flash ("config_path=/etc/..."), link it to /var/lib/zerotier-one, ignore local_conf_path, take
+# networks from "list join" and do not ask procd to restart the program. On those, ZeroTier reads local.conf from
+# its home, and the script's own "stop" deletes the networks' settings and reloads the firewall.
+init_code() {  # the start-up script without its comment lines
+	grep -v '^[[:space:]]*#' "$ZT_INIT" 2>/dev/null || true
+}
+persistent_home_dir() {
+	[ -f "$ZT_INIT" ] || return 0
+	init_code | grep -q 'local_conf_path' && return 0
+	init_code | sed -n 's#^[[:space:]]*config_path=\(/[^[:space:]$"]*\)[[:space:]]*$#\1#p' | head -n 1
+}
+init_respawns() {
+	init_code | grep -q 'procd_set_param respawn'
+}
+vendor_refuse() {
+	[ -n "$(persistent_home_dir)" ] || return 0
+	echo "На этой прошивке ZeroTier запускается её собственным сценарием: сеть, её включение и выключение задаются в собственной панели ZeroTier прошивки. Эта панель здесь только показывает состояние и держит доступ." >&2
+	return 2
+}
+# Restart ZeroTier. Where procd does not restart the program, only the program is stopped and the script's "start"
+# brings it back: the script's "stop" would delete the networks' settings and reload the firewall.
+restart_zerotier() {
+	if init_respawns; then
+		"$ZT_INIT" restart
+		return $?
+	fi
+	rz_p="$(pidof zerotier-one 2>/dev/null | awk '{print $1}' || true)"
+	if [ -n "$rz_p" ]; then
+		kill "$rz_p" 2>/dev/null || true
+		rz_i=0
+		while kill -0 "$rz_p" 2>/dev/null && [ "$rz_i" -lt 10 ]; do sleep 1; rz_i=$((rz_i + 1)); done
+		kill -9 "$rz_p" 2>/dev/null || true
+	fi
+	"$ZT_INIT" start
+}
+# An earlier version of this panel wrote a uci section "global" of type zerotier. A vendor script that starts one
+# program per such section then starts a second, failing one. It is removed only when it holds nothing but the keys
+# this panel wrote.
+forget_stray_global_section() {
+	[ "$(uci -q get zerotier.global 2>/dev/null || true)" = zerotier ] || return 0
+	for fs_k in $(uci -q show zerotier.global 2>/dev/null | sed -n 's/^zerotier\.global\.\([^=]*\)=.*/\1/p'); do
+		case "$fs_k" in enabled|port|local_conf_path) ;; *) return 0 ;; esac
+	done
+	uci delete zerotier.global || return 1
+	uci commit zerotier || return 1
+	note_zerotier_settings_seen
+	echo "Удалена секция zerotier.global, оставленная прежней версией панели: на этой прошивке она запускала второй, сразу падающий экземпляр ZeroTier."
+}
+# reload_config (run by LuCI's "Save & Apply") restarts a service whose settings changed since it last looked; on
+# such a firmware that restart goes through the script's "stop", which deletes the networks' settings. The change
+# above needs no restart of that kind, so reload_config's record of the ZeroTier settings is brought up to date.
+note_zerotier_settings_seen() {
+	ns_f=/var/run/config.md5
+	[ -f "$ns_f" ] && grep -q ' /var/run/config.check/zerotier$' "$ns_f" || return 0
+	ns_sum="$(uci show zerotier 2>/dev/null | md5sum | cut -d' ' -f1)"
+	printf '%s' "$ns_sum" | grep -Eq '^[0-9a-f]{32}$' || return 0
+	sed -i "s#^[0-9a-f]*  /var/run/config.check/zerotier\$#${ns_sum}  /var/run/config.check/zerotier#" "$ns_f" || true
 }
 
 networks_are_ready() {
@@ -148,8 +212,19 @@ ensure_transport_independence() {
 	fi
 	rm -f "$nft_candidate"
 
-	current_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
-	[ -n "$current_local_conf" ] || current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
+	vendor_home="$(persistent_home_dir)"
+	if [ -n "$vendor_home" ]; then
+		# this firmware ignores local_conf_path: ZeroTier reads local.conf from its own home on flash
+		mkdir -p "$vendor_home" || return 1
+		if [ -f "$vendor_home/local.conf" ] && [ ! -L "$vendor_home/local.conf" ]; then
+			current_local_conf="$vendor_home/local.conf"
+		else
+			current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
+		fi
+	else
+		current_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
+		[ -n "$current_local_conf" ] || current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
+	fi
 	if [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ] && [ ! -f "$current_local_conf" ]; then
 			cp "$ZT_LOCAL_CONF_TEMPLATE" "${ZT_SUPPORT_LOCAL_CONF}.new" || return 1
 			chmod 0600 "${ZT_SUPPORT_LOCAL_CONF}.new" || return 1
@@ -185,10 +260,18 @@ ensure_transport_independence() {
 		fi
 	fi
 
-	uci set zerotier.global=zerotier || return 1
-	uci set zerotier.global.port=9993 || return 1
-	uci set "zerotier.global.local_conf_path=${current_local_conf}" || return 1
-	uci commit zerotier || return 1
+	if [ -n "$vendor_home" ]; then
+		if [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ] &&
+			[ "$(readlink "$vendor_home/local.conf" 2>/dev/null || true)" != "$ZT_SUPPORT_LOCAL_CONF" ]; then
+			ln -sf "$ZT_SUPPORT_LOCAL_CONF" "$vendor_home/local.conf" || return 1
+		fi
+		forget_stray_global_section || return 1
+	else
+		uci set zerotier.global=zerotier || return 1
+		uci set zerotier.global.port=9993 || return 1
+		uci set "zerotier.global.local_conf_path=${current_local_conf}" || return 1
+		uci commit zerotier || return 1
+	fi
 
 	if [ "$nft_changed" = 1 ] && command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
 		if ! fw4 print > /tmp/zrs-fw4-candidate.nft || ! nft -c -f /tmp/zrs-fw4-candidate.nft; then
@@ -285,6 +368,11 @@ snapshot_transport_state() {
 	if [ -f "$ZT_BYPASS_FILE" ]; then
 		cp -p "$ZT_BYPASS_FILE" "$ZT_UPGRADE_SNAPSHOT/bypass.nft" || return 1
 	fi
+	snap_home="$(persistent_home_dir)"
+	printf '%s\n' "$snap_home" > "$ZT_UPGRADE_SNAPSHOT/vendor-home" || return 1
+	if [ -n "$snap_home" ] && { [ -e "$snap_home/local.conf" ] || [ -L "$snap_home/local.conf" ]; }; then
+		cp -P -p "$snap_home/local.conf" "$ZT_UPGRADE_SNAPSHOT/home-local-conf" || return 1
+	fi
 
 	ZT_UPGRADE_NETWORK_IDS="$(configured_network_ids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 	ZT_UPGRADE_WAS_READY=0
@@ -313,6 +401,14 @@ restore_transport_snapshot() {
 	fi
 	restore_snapshot_file support-local-conf "$ZT_SUPPORT_LOCAL_CONF" || return 1
 	restore_snapshot_file bypass.nft "$ZT_BYPASS_FILE" || return 1
+	snap_home="$(cat "$ZT_UPGRADE_SNAPSHOT/vendor-home" 2>/dev/null || true)"
+	if [ -n "$snap_home" ]; then
+		rm -f "$snap_home/local.conf"
+		[ ! -e "$ZT_UPGRADE_SNAPSHOT/home-local-conf" ] && [ ! -L "$ZT_UPGRADE_SNAPSHOT/home-local-conf" ] ||
+			cp -P -p "$ZT_UPGRADE_SNAPSHOT/home-local-conf" "$snap_home/local.conf" || return 1
+		# the settings are back as they were: reload_config must not see a change in them either
+		note_zerotier_settings_seen
+	fi
 	/etc/init.d/firewall reload || /etc/init.d/firewall restart || return 1
 }
 
@@ -323,7 +419,9 @@ cleanup_transport_snapshot() {
 		"$ZT_UPGRADE_SNAPSHOT/local-conf-path" \
 		"$ZT_UPGRADE_SNAPSHOT/local-conf" \
 		"$ZT_UPGRADE_SNAPSHOT/support-local-conf" \
-		"$ZT_UPGRADE_SNAPSHOT/bypass.nft"
+		"$ZT_UPGRADE_SNAPSHOT/bypass.nft" \
+		"$ZT_UPGRADE_SNAPSHOT/vendor-home" \
+		"$ZT_UPGRADE_SNAPSHOT/home-local-conf"
 	rmdir "$ZT_UPGRADE_SNAPSHOT" 2>/dev/null || true
 	ZT_UPGRADE_SNAPSHOT=""
 }
@@ -347,8 +445,10 @@ wait_for_zerotier_ready() {
 	return 1
 }
 
+# 0: back with the fixed ports; 3: back in its networks, but this firmware does not take the fixed ports;
+# 1: not back - roll back
 restart_and_verify_transport() {
-	if ! /etc/init.d/zerotier restart; then
+	if ! restart_zerotier; then
 		echo "Служба ZeroTier не перезапустилась; требуется автоматический откат." >&2
 		return 1
 	fi
@@ -357,8 +457,8 @@ restart_and_verify_transport() {
 		return 1
 	fi
 	if ! transport_ports_are_fixed; then
-		echo "ZeroTier вернулся, но постоянные порты не применились; требуется автоматический откат." >&2
-		return 1
+		echo "ZeroTier вернулся в свои сети, но постоянные порты на этой прошивке не применились." >&2
+		return 3
 	fi
 	ensure_transport_independence || return 1
 	wait_for_zerotier_ready
@@ -376,15 +476,22 @@ install_or_upgrade() {
 
 	if transport_restart_required; then
 		echo "Применяю обновление ZeroTier без перезагрузки роутера..."
-		if ! restart_and_verify_transport; then
-			echo "Восстанавливаю прежний транспорт и существующие виртуальные сети." >&2
-			restore_transport_snapshot || true
-			/etc/init.d/zerotier restart || true
-			wait_for_zerotier_ready || true
-			cleanup_transport_snapshot
-			return 1
-		fi
-		echo "ZeroTier вернулся в существующие виртуальные сети; обновление завершено."
+		if restart_and_verify_transport; then rv_rc=0; else rv_rc=$?; fi
+		case "$rv_rc" in
+			0) echo "ZeroTier вернулся в существующие виртуальные сети; обновление завершено." ;;
+			3)
+				# Nothing to roll back: ZeroTier works in its networks. The bypass follows the ports it really uses.
+				ensure_transport_independence || true
+				echo "ZeroTier работает в своих сетях, но на собственных портах этой прошивки: постоянные порты здесь не применяются."
+				echo "Обход Podkop настроен на порты, которые ZeroTier использует сейчас; сторож доступа держит его в соответствии с ними." ;;
+			*)
+				echo "Восстанавливаю прежний транспорт и существующие виртуальные сети." >&2
+				restore_transport_snapshot || true
+				restart_zerotier || true
+				wait_for_zerotier_ready || true
+				cleanup_transport_snapshot
+				return 1 ;;
+		esac
 	elif [ "$ZT_UPGRADE_WAS_READY" = 1 ]; then
 		echo "ZeroTier уже использует защищенные постоянные порты; перезапуск не требуется."
 	else
@@ -421,6 +528,7 @@ configure_network() {
 		echo "Неверный Network ID. Нужно 16 символов HEX, например 0123456789abcdef." >&2
 		return 2
 	fi
+	vendor_refuse || return $?
 	pm_install_zerotier || return 1
 	snapshot_transport_state || { cleanup_transport_snapshot; return 1; }
 	if ! configure_network_apply "$network_id"; then
@@ -442,6 +550,7 @@ configure_network() {
 }
 
 leave_network() {
+	vendor_refuse || return $?
 	saved_network_id="$(uci -q get "zerotier.${NETWORK_SECTION}.id" || true)"
 	[ -n "$saved_network_id" ] || { echo "Сохранённая сеть ZeroTier не найдена." >&2; return 1; }
 	[ -z "${1:-}" ] || [ "$1" = "$saved_network_id" ] || {
@@ -459,6 +568,7 @@ leave_network() {
 }
 
 disable_service() {
+	vendor_refuse || return $?
 	uci set zerotier.global=zerotier
 	uci set zerotier.global.enabled='0'
 	uci commit zerotier
@@ -468,7 +578,7 @@ disable_service() {
 
 restart_service() {
 	ensure_transport_independence
-	/etc/init.d/zerotier restart
+	restart_zerotier
 	sleep 5
 	status
 }

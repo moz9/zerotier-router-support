@@ -1,6 +1,8 @@
 #!/bin/sh
 # Lab stand-in for ubus, enough for /etc/rc.common to start and stop one procd service: "call service set" hands
-# the instance's command line to mini-procd, "call service delete" stops the instance and waits until it is gone.
+# the first instance's command line to mini-procd (and whether the script asked for respawn; further instances are
+# only written down: a script that registers two programs on one home gets one running and one failing at once),
+# "call service delete" stops the instance and waits until it is gone.
 # Everything else answers "not found", as ubus does without a daemon.
 D=/tmp/lab/procd
 echo "$*" >> /tmp/lab/ubus-calls 2>/dev/null
@@ -10,8 +12,11 @@ name="$(jsonfilter -s "${4:-}" -e '@.name' 2>/dev/null)"
 case "$3" in
 	set|add)
 		[ "$name" = zerotier ] || exit 0
-		jsonfilter -s "$4" -e '@.instances.*.command[*]' 2>/dev/null | tr '\n' ' ' > "$D/$name.cmd.new"
+		jsonfilter -s "$4" -e '@.instances.instance1.command[*]' 2>/dev/null | tr '\n' ' ' > "$D/$name.cmd.new"
 		[ -s "$D/$name.cmd.new" ] || { rm -f "$D/$name.cmd.new"; exit 0; }
+		if jsonfilter -s "$4" -e '@.instances.instance1.respawn' >/dev/null 2>&1; then : > "$D/$name.respawn"; else rm -f "$D/$name.respawn"; fi
+		jsonfilter -s "$4" -e '@.instances.instance2.command[0]' >/dev/null 2>&1 &&
+			echo "$(date +%H:%M:%S) ubus: a second instance was set as well (not run here; on the router it fails at once)" >> "$D/log"
 		mv "$D/$name.cmd.new" "$D/$name.cmd"; : > "$D/$name.set" ;;
 	delete)
 		[ "$name" = zerotier ] || exit 0
@@ -23,8 +28,10 @@ case "$3" in
 			kill -9 "$p" 2>/dev/null
 		fi ;;
 	list)
-		if [ "$name" = zerotier ] && [ -f "$D/zerotier.cmd" ]; then
+		if [ "$name" = zerotier ] && [ -f "$D/zerotier.cmd" ] && [ -f "$D/zerotier.respawn" ]; then
 			echo '{"zerotier":{"instances":{"instance1":{"running":true,"respawn":{"threshold":3600,"timeout":5,"retry":5}}}}}'
+		elif [ "$name" = zerotier ] && [ -f "$D/zerotier.cmd" ]; then
+			echo '{"zerotier":{"instances":{"instance1":{"running":true}}}}'
 		else echo '{}'; fi ;;
 	*) exit 4 ;;
 esac

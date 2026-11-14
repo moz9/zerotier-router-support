@@ -97,7 +97,8 @@ esac'
 	-c*) exit 0 ;;
 	-f*) echo "nft sync" >> "$W/actions" ;;
 esac'
-	initd zerotier 'case "$1" in
+	initd zerotier 'RESPAWN="procd_set_param respawn"   # asks procd to start the daemon again, like the stock script
+case "$1" in
 	enabled) [ -e "$W/zt_boot" ]; exit $? ;;
 	restart|start) echo "zerotier $1" >> "$W/actions"
 		p="$(cat "$W/pid" 2>/dev/null)"; [ -n "$p" ] && kill "$p" 2>/dev/null
@@ -112,6 +113,32 @@ esac; exit 0'
 	stop) echo "podkop stop" >> "$W/actions"; rm -f "$W/podkop_table" ;;
 	start) echo "podkop start" >> "$W/actions"; : > "$W/podkop_table" ;;
 esac'
+}
+# A vendor start-up script like RouteRich's: ZeroTier's home on flash (linked to /var/lib/zerotier-one), the network
+# in "list join" of its own section, no respawn; its "stop" deletes the networks' settings and reloads the firewall,
+# its "start" only touches them and starts nothing while the program runs.
+vendor_world() {
+	: > "$W/respawn"
+	mkdir -p "$T/etc/config/zero"
+	mv "$T/var/lib/zerotier-one/networks.d" "$T/etc/config/zero/" && rmdir "$T/var/lib/zerotier-one" &&
+		ln -s "$T/etc/config/zero" "$T/var/lib/zerotier-one"
+	printf "zerotier.sample_config=zerotier\nzerotier.sample_config.enabled='1'\nzerotier.sample_config.join='%s'\nzerotier.sample_config.nat='1'\n" "$ID" > "$W/uci_show"
+	sed -i '/^zerotier\./d' "$W/uci"
+	initd zerotier 'case "$1" in
+	enabled) [ -e "$W/zt_boot" ]; exit $? ;;
+	stop|restart) echo "zerotier $1" >> "$W/actions"
+		p="$(cat "$W/pid" 2>/dev/null)"; [ -n "$p" ] && kill "$p" 2>/dev/null
+		rm -f "$T/etc/config/zero/networks.d/"*.conf; echo "firewall reload" >> "$W/actions"
+		[ "$1" = restart ] || exit 0 ;;
+	start) echo "zerotier start" >> "$W/actions" ;;
+	*) exit 0 ;;
+esac
+touch "$T/etc/config/zero/networks.d/'"$ID"'.conf"
+p="$(cat "$W/pid" 2>/dev/null)"
+if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then :
+elif [ ! -e "$W/no_start" ]; then "'"$REAL_SLEEP"'" 100000 > /dev/null 2>&1 & echo $! > "$W/pid"; echo $! >> "$W/allpids"; fi
+[ -f "$W/on_restart" ] && . "$W/on_restart"
+exit 0'
 }
 stub() { printf '#!/bin/sh\nW="%s"; T="%s"\n%s\n' "$W" "$T" "$2" > "$B/$1"; chmod +x "$B/$1"; }
 initd() { printf '#!/bin/sh\nW="%s"; T="%s"\n%s\n' "$W" "$T" "$2" > "$T/etc/init.d/$1"; chmod +x "$T/etc/init.d/$1"; }
@@ -430,20 +457,54 @@ if want kept-settings-first; then world kept-settings-first
 fi
 
 if want no-respawn; then world no-respawn
-	# a router whose start-up script does not ask procd to start the daemon again (one such router in the fleet)
-	: > "$W/respawn"
+	# a start-up script that does not ask procd to start the daemon again, with ZeroTier's home in RAM (emptied on start)
+	: > "$W/respawn"; sed -i '/procd_set_param respawn/d' "$T/etc/init.d/zerotier"
 	span 60 120
 	controller_gone
 	"$SH" "$T/etc/init.d/zerotier" restart; : > "$W/actions"
 	old="$(cat "$W/pid")"
 	span 180 300
-	check 'the daemon is not killed where nothing would start it again' "$(cat "$W/pid")" "$old"
+	check 'kept settings are not put back where the start-up script would empty them' "$(cat "$W/pid")" "$old"
 	log_has 'not started again by the system'
 	span 360 420
-	expect_actions 'zerotier restart' 'the ordinary steps go on'
+	expect_actions 'zerotier start' 'the ordinary steps go on: the daemon is stopped alone and the script starts it'
+	check 'a new daemon' "$([ "$(cat "$W/pid")" != "$old" ] && echo new)" new
 	kill "$(cat "$W/pid")"; : > "$W/pid"; : > "$W/actions"
 	at 480
-	expect_actions 'zerotier restart' 'and a daemon that died there is started by the guard'
+	expect_actions 'zerotier start' 'and a daemon that died there is started by the guard at once'
+fi
+
+if want vendor-home; then world vendor-home; vendor_world
+	span 60 600
+	expect_actions '' 'a healthy router with a vendor start-up script is left alone'
+	check 'its network from "list join" is guarded' "$(state_of S_HEALTH)" ok
+	[ -s "$T/$cache" ] && ok || bad 'the network settings were not kept on flash'
+	# the daemon dies: nothing but the guard starts it again on this router, so the guard does not wait for procd
+	kill "$(cat "$W/pid")"; : > "$W/actions"
+	at 660; expect_actions 'zerotier start' "a dead daemon is started by the script's start, never through its stop"
+	at 720; check 'state' "$(state_of S_HEALTH)" ok
+	# ZeroTier goes offline: the restart of the ladder stops the daemon alone and uses the script's start
+	old="$(cat "$W/pid")"; : > "$W/actions"; break_zt
+	echo 'echo ONLINE > "$W/state"' > "$W/on_restart"
+	span 780 1200
+	expect_actions 'zerotier start' 'restart = the daemon stopped alone, then start (no stop, no firewall reload)'
+	check 'a new daemon' "$([ "$(cat "$W/pid")" != "$old" ] && echo new)" new
+	check 'the network settings on flash are still there' "$(grep -c "^nwid=$ID" "$T/etc/config/zero/networks.d/$ID.conf")" 1
+	check 'state' "$(state_of S_HEALTH)" ok
+	world vendor-home-kept; CUR=vendor-home/kept-settings; vendor_world
+	span 60 600
+	payload="$(tail -n +2 "$T/$cache" | sha256sum | cut -c1-64)"
+	# someone restarts ZeroTier in the firmware's own panel while the controller does not answer: the script's stop
+	# deletes the network settings, its start leaves an empty file, the daemon waits for settings
+	"$SH" "$T/etc/init.d/zerotier" restart; echo REQUESTING_CONFIGURATION > "$W/status"; echo '' > "$W/ips"
+	echo 'if [ "$(wc -c < "$T/etc/config/zero/networks.d/'"$ID"'.conf")" -gt 64 ]; then echo OK > "$W/status"; echo 10.9.8.7/24 > "$W/ips"; fi' > "$W/on_restart"
+	old="$(cat "$W/pid")"; : > "$W/actions"
+	span 660 840
+	expect_actions 'zerotier start' 'kept settings put back: the daemon stopped alone and started by the script'
+	check 'the daemon was started again (new pid)' "$([ "$(cat "$W/pid")" != "$old" ] && echo new)" new
+	check 'the settings the daemon reads are the kept ones' "$(sha256sum < "$T/etc/config/zero/networks.d/$ID.conf" | cut -c1-64)" "$payload"
+	log_has 'kept network settings put back'
+	at 900; check 'state' "$(state_of S_HEALTH)" ok
 fi
 
 if want no-internet; then world no-internet
@@ -596,6 +657,7 @@ fi
 
 if want switched-off; then world switched-off
 	sed -i 's/^zerotier.global.enabled=1/zerotier.global.enabled=0/' "$W/uci"
+	sed -i "s/^zerotier.global.enabled='1'/zerotier.global.enabled='0'/" "$W/uci_show"
 	kill "$(cat "$W/pid")"; : > "$W/pid"
 	span 60 9000 1800
 	expect_actions '' 'ZeroTier switched off in the settings is left off'

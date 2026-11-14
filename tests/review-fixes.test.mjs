@@ -76,6 +76,7 @@ test('leave refuses an edited network ID before touching ZeroTier', () => {
   const script = `NETWORK_SECTION=router_support
 uci() { case "$*" in '-q get zerotier.router_support.id') printf '%s\\n' 0123456789abcdef ;; *) exit 9 ;; esac; }
 zerotier-cli() { exit 9; }
+vendor_refuse() { return 0; }
 leave_network() {${body('leave_network')}
 }
 if leave_network fedcba9876543210; then exit 8; fi

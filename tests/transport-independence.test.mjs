@@ -53,7 +53,8 @@ test("helper applies the bypass before firewall reload and before every ZeroTier
   const configure = helper.match(/configure_network_apply\(\)\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
   const restart = helper.match(/restart_service\(\)\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
   assert.ok(configure.indexOf("ensure_transport_independence") < configure.indexOf("/etc/init.d/zerotier restart"));
-  assert.ok(restart.indexOf("ensure_transport_independence") < restart.indexOf("/etc/init.d/zerotier restart"));
+  assert.ok(restart.indexOf("ensure_transport_independence") < restart.indexOf("restart_zerotier"));
+  assert.ok(restart.indexOf("restart_zerotier") > 0);
 });
 
 test("sysupgrade retention and both installers include the same support files", () => {
@@ -90,7 +91,7 @@ test("the published one-liner is the universal install and update entrypoint", (
 
   assert.match(readme, /универсальн[^\n]*установк[^\n]*обновлен/i);
   assert.match(readme, /wget -qO- https:\/\/raw\.githubusercontent\.com\/moz9\/zerotier-router-support\/main\/router-direct-install\.sh \| sh/);
-  assert.match(router, /"\$\{HELPER_DIR\}\/helper" install/);
+  assert.match(router, /"\$\{HELPER_DIR\}\/helper\.new" install/);
 });
 
 test("install automatically upgrades a running configured ZeroTier and verifies recovery", () => {
@@ -132,7 +133,36 @@ test("critical firewall and restart failures are handled explicitly under BusyBo
 
   assert.match(helper, /if ! fw4 check; then[\s\S]*return 1/);
   assert.match(helper, /if ! \/etc\/init\.d\/firewall reload[\s\S]*\/etc\/init\.d\/firewall restart/);
-  assert.match(helper, /if ! \/etc\/init\.d\/zerotier restart; then[\s\S]*return 1/);
+  assert.match(helper, /if ! restart_zerotier; then[\s\S]*return 1/);
+});
+
+test("on a vendor script without respawn ZeroTier is restarted without the script's stop", () => {
+  // RouteRich's start-up script deletes the networks' settings in its stop and does not ask procd to restart the
+  // program: there only the program is stopped and the script's start brings it back
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+  const fn = helper.match(/restart_zerotier\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(fn, /if init_respawns; then\s*"\$ZT_INIT" restart/);
+  assert.match(fn, /kill "\$rz_p"[\s\S]*"\$ZT_INIT" start/);
+  assert.doesNotMatch(fn, /ZT_INIT" stop/);
+  // where the fixed ports do not apply, the install keeps ZeroTier as it works and says so, without a rollback
+  const upgrade = helper.match(/install_or_upgrade\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(helper, /постоянные порты на этой прошивке не применились[\s\S]*return 3/);
+  assert.match(upgrade, /3\)[\s\S]*ensure_transport_independence \|\| true[\s\S]*собственных портах этой прошивки/);
+});
+
+test("a vendor script is never restarted by reload_config because of the app's own uci change", () => {
+  // the vendor's reload = stop + start, and its stop deletes the networks' settings: after removing the stray
+  // section, and after putting the old settings back in a rollback, reload_config's record is brought up to date
+  const helper = read("openwrt/usr/libexec/zerotier-support/helper");
+  const forget = helper.match(/forget_stray_global_section\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const restore = helper.match(/restore_transport_snapshot\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(forget, /uci commit zerotier[\s\S]*note_zerotier_settings_seen/);
+  assert.match(restore, /if \[ -n "\$snap_home" \]; then[\s\S]*note_zerotier_settings_seen/);
+  const note = helper.match(/note_zerotier_settings_seen\(\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  assert.match(note, /\/var\/run\/config\.md5/);
+  assert.match(note, /\^\[0-9a-f\]\{32\}\$/, "only a well-formed checksum is written");
+  // the section is removed only when it holds nothing but what the old panel wrote
+  assert.match(forget, /enabled\|port\|local_conf_path\) ;; \*\) return 0/);
 });
 
 test("status parses network names with spaces from JSON instead of fixed text columns", () => {

@@ -5,9 +5,12 @@
 if [ -e /tmp/lab/die-once ]; then
 	rm -f /tmp/lab/die-once
 	echo "$(date +%H:%M:%S) installer killed in the middle" >> /tmp/lab/firewall-calls
-	pkill -9 -f 'router-install.sh' 2>/dev/null
-	pkill -9 -f 'zerotier-support/helper install' 2>/dev/null
+	# the routers' BusyBox has pgrep but no pkill
+	for p in $(pgrep -f 'router-install\.sh') $(pgrep -f 'zerotier-support/helper[.a-z]* install'); do kill -9 "$p" 2>/dev/null; done
 	exit 1
 fi
-case "${1:-}" in print) echo 'table inet fw4 { }' ;; esac
+case "${1:-}" in
+	print) echo 'table inet fw4 { }' ;;
+	reload|restart) echo "$(date +%H:%M:%S) fw4 $1" >> /tmp/lab/firewall-calls ;;
+esac
 exit 0
