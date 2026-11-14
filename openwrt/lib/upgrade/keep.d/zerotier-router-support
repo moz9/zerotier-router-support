@@ -1,0 +1,11 @@
+/etc/zerotier.conf
+/etc/zerotier-router-support.conf
+/etc/nftables.d/20-podkop-zerotier-bypass.nft
+/usr/libexec/zerotier-support/helper
+/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft
+/usr/libexec/zerotier-support/zerotier-router-support.conf
+/usr/share/rpcd/ucode/zerotier.support
+/usr/share/rpcd/acl.d/zerotier-support.json
+/usr/share/luci/menu.d/zerotier-support.json
+/www/luci-static/resources/view/services/zerotier.js
+/lib/upgrade/keep.d/zerotier-router-support

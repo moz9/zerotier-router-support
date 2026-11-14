@@ -34,20 +34,20 @@ is_safe_target() {
 }
 
 pm_install_zerotier() {
-	if command -v zerotier-cli >/dev/null 2>&1; then
-		echo "ZeroTier уже установлен."
-		return 0
-	fi
+	packages=""
+	command -v zerotier-cli >/dev/null 2>&1 || packages=zerotier
+	command -v jq >/dev/null 2>&1 || packages="${packages:+$packages }jq"
+	[ -n "$packages" ] || return 0
 
 	if command -v apk >/dev/null 2>&1; then
 		apk update || true
-		apk add zerotier
+		apk add $packages
 		return $?
 	fi
 
 	if command -v opkg >/dev/null 2>&1; then
 		opkg update
-		opkg install zerotier
+		opkg install $packages
 		return $?
 	fi
 
@@ -110,12 +110,13 @@ EOF
 }
 
 ensure_transport_independence() {
+	nft_previous=""
 	if [ ! -s "$ZT_LOCAL_CONF_TEMPLATE" ] || [ ! -s "$ZT_BYPASS_TEMPLATE" ]; then
 		echo "Не найдены шаблоны защиты транспорта ZeroTier. Повторите установку панели." >&2
 		return 1
 	fi
 
-	mkdir -p /etc/nftables.d
+	mkdir -p /etc/nftables.d || return 1
 	bypass_ports="$ZT_PRIMARY_PORT $ZT_SECONDARY_PORT $ZT_TERTIARY_PORT"
 	for runtime_port in $(current_zerotier_ports); do
 		case "$runtime_port" in
@@ -129,15 +130,17 @@ ensure_transport_independence() {
 	done
 	bypass_elements="$(printf '%s' "$bypass_ports" | sed 's/[[:space:]][[:space:]]*/, /g')"
 	nft_candidate="/tmp/zrs-bypass-candidate.$$"
-	sed "s/^[[:space:]]*elements = {.*}/\telements = { $bypass_elements }/" "$ZT_BYPASS_TEMPLATE" > "$nft_candidate"
+	sed "s/^[[:space:]]*elements = {.*}/\telements = { $bypass_elements }/" "$ZT_BYPASS_TEMPLATE" > "$nft_candidate" || { rm -f "$nft_candidate"; return 1; }
 
 	nft_changed=0
 	if [ ! -f "$ZT_BYPASS_FILE" ] || ! cmp -s "$nft_candidate" "$ZT_BYPASS_FILE"; then
 		nft_previous="/tmp/zrs-bypass-previous.$$"
-		[ -f "$ZT_BYPASS_FILE" ] && cp -p "$ZT_BYPASS_FILE" "$nft_previous" || true
-		cp "$nft_candidate" "${ZT_BYPASS_FILE}.new"
-		chmod 0644 "${ZT_BYPASS_FILE}.new"
-		mv "${ZT_BYPASS_FILE}.new" "$ZT_BYPASS_FILE"
+		if [ -f "$ZT_BYPASS_FILE" ]; then
+			cp -p "$ZT_BYPASS_FILE" "$nft_previous" || { rm -f "$nft_candidate"; return 1; }
+		fi
+		cp "$nft_candidate" "${ZT_BYPASS_FILE}.new" || { rm -f "$nft_candidate" "$nft_previous"; return 1; }
+		chmod 0644 "${ZT_BYPASS_FILE}.new" || return 1
+		mv "${ZT_BYPASS_FILE}.new" "$ZT_BYPASS_FILE" || return 1
 		nft_changed=1
 	fi
 	rm -f "$nft_candidate"
@@ -145,9 +148,9 @@ ensure_transport_independence() {
 	current_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
 	[ -n "$current_local_conf" ] || current_local_conf="$ZT_SUPPORT_LOCAL_CONF"
 	if [ "$current_local_conf" = "$ZT_SUPPORT_LOCAL_CONF" ] && [ ! -f "$current_local_conf" ]; then
-			cp "$ZT_LOCAL_CONF_TEMPLATE" "${ZT_SUPPORT_LOCAL_CONF}.new"
-			chmod 0600 "${ZT_SUPPORT_LOCAL_CONF}.new"
-			mv "${ZT_SUPPORT_LOCAL_CONF}.new" "$ZT_SUPPORT_LOCAL_CONF"
+			cp "$ZT_LOCAL_CONF_TEMPLATE" "${ZT_SUPPORT_LOCAL_CONF}.new" || return 1
+			chmod 0600 "${ZT_SUPPORT_LOCAL_CONF}.new" || return 1
+			mv "${ZT_SUPPORT_LOCAL_CONF}.new" "$ZT_SUPPORT_LOCAL_CONF" || return 1
 	fi
 	# Merge even our own configuration: it may contain user exclusions and keys.
 	if ! cmp -s "$ZT_LOCAL_CONF_TEMPLATE" "$current_local_conf" || command -v jq >/dev/null 2>&1; then
@@ -169,25 +172,25 @@ ensure_transport_independence() {
 			rm -f "$merged_conf"
 			return 1
 		fi
-		jq -e ".settings.secondaryPort == $ZT_SECONDARY_PORT and .settings.tertiaryPort == $ZT_TERTIARY_PORT" "$merged_conf" >/dev/null || return 1
+		jq -e ".settings.secondaryPort == $ZT_SECONDARY_PORT and .settings.tertiaryPort == $ZT_TERTIARY_PORT" "$merged_conf" >/dev/null || { rm -f "$merged_conf"; return 1; }
 		if ! cmp -s "$merged_conf" "$current_local_conf"; then
-			[ -e "${current_local_conf}.zrs-before-transport" ] || cp -p "$current_local_conf" "${current_local_conf}.zrs-before-transport"
-			chmod --reference="$current_local_conf" "$merged_conf" 2>/dev/null || chmod 0600 "$merged_conf"
-			mv "$merged_conf" "$current_local_conf"
+			[ -e "${current_local_conf}.zrs-before-transport" ] || cp -p "$current_local_conf" "${current_local_conf}.zrs-before-transport" || return 1
+			chmod --reference="$current_local_conf" "$merged_conf" 2>/dev/null || chmod 0600 "$merged_conf" || return 1
+			mv "$merged_conf" "$current_local_conf" || return 1
 		else
 			rm -f "$merged_conf"
 		fi
 	fi
 
-	uci set zerotier.global=zerotier
-	uci set zerotier.global.port=9993
-	uci set "zerotier.global.local_conf_path=${current_local_conf}"
-	uci commit zerotier
+	uci set zerotier.global=zerotier || return 1
+	uci set zerotier.global.port=9993 || return 1
+	uci set "zerotier.global.local_conf_path=${current_local_conf}" || return 1
+	uci commit zerotier || return 1
 
 	if [ "$nft_changed" = 1 ] && command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
 		if ! fw4 print > /tmp/zrs-fw4-candidate.nft || ! nft -c -f /tmp/zrs-fw4-candidate.nft; then
 			if [ -f "${nft_previous:-}" ]; then
-				mv "$nft_previous" "$ZT_BYPASS_FILE"
+				mv "$nft_previous" "$ZT_BYPASS_FILE" || return 1
 			else
 				rm -f "$ZT_BYPASS_FILE"
 			fi
@@ -199,6 +202,7 @@ ensure_transport_independence() {
 			/etc/init.d/firewall restart || return 1
 		fi
 	fi
+	[ -z "${nft_previous:-}" ] || rm -f "$nft_previous"
 	if command -v nft >/dev/null 2>&1; then
 		sync_live_bypass_set "$bypass_elements" || return 1
 	fi
@@ -222,29 +226,29 @@ ensure_ping_rule() {
 
 ensure_firewall() {
 	if ! uci -q get "firewall.${FW_ZONE}" >/dev/null; then
-		uci set "firewall.${FW_ZONE}=zone"
+		uci set "firewall.${FW_ZONE}=zone" || return 1
 	fi
 
-	uci set "firewall.${FW_ZONE}.name=${FW_ZONE}"
+	uci set "firewall.${FW_ZONE}.name=${FW_ZONE}" || return 1
 	uci -q delete "firewall.${FW_ZONE}.network" || true
 	uci -q delete "firewall.${FW_ZONE}.device" || true
-	uci add_list "firewall.${FW_ZONE}.device=zt+"
-	uci set "firewall.${FW_ZONE}.input=REJECT"
-	uci set "firewall.${FW_ZONE}.output=ACCEPT"
-	uci set "firewall.${FW_ZONE}.forward=REJECT"
+	uci add_list "firewall.${FW_ZONE}.device=zt+" || return 1
+	uci set "firewall.${FW_ZONE}.input=REJECT" || return 1
+	uci set "firewall.${FW_ZONE}.output=ACCEPT" || return 1
+	uci set "firewall.${FW_ZONE}.forward=REJECT" || return 1
 
 	if ! uci -q get "firewall.${FW_RULE}" >/dev/null; then
-		uci set "firewall.${FW_RULE}=rule"
+		uci set "firewall.${FW_RULE}=rule" || return 1
 	fi
 
-	uci set "firewall.${FW_RULE}.name=Allow-ZeroTier-Support-To-Router"
-	uci set "firewall.${FW_RULE}.src=${FW_ZONE}"
-	uci set "firewall.${FW_RULE}.proto=tcp"
+	uci set "firewall.${FW_RULE}.name=Allow-ZeroTier-Support-To-Router" || return 1
+	uci set "firewall.${FW_RULE}.src=${FW_ZONE}" || return 1
+	uci set "firewall.${FW_RULE}.proto=tcp" || return 1
 	uci -q delete "firewall.${FW_RULE}.dest_port" || true
-	uci add_list "firewall.${FW_RULE}.dest_port=22"
-	uci add_list "firewall.${FW_RULE}.dest_port=80"
-	uci add_list "firewall.${FW_RULE}.dest_port=443"
-	uci set "firewall.${FW_RULE}.target=ACCEPT"
+	uci add_list "firewall.${FW_RULE}.dest_port=22" || return 1
+	uci add_list "firewall.${FW_RULE}.dest_port=80" || return 1
+	uci add_list "firewall.${FW_RULE}.dest_port=443" || return 1
+	uci set "firewall.${FW_RULE}.target=ACCEPT" || return 1
 	ensure_ping_rule || return 1
 
 	if command -v fw4 >/dev/null 2>&1; then
@@ -264,17 +268,20 @@ ensure_firewall() {
 }
 
 snapshot_transport_state() {
-	ZT_UPGRADE_SNAPSHOT="/tmp/zrs-transport-rollback.$$"
-	mkdir -p "$ZT_UPGRADE_SNAPSHOT"
-	cp -p /etc/config/zerotier "$ZT_UPGRADE_SNAPSHOT/zerotier.uci"
-	cp -p /etc/config/firewall "$ZT_UPGRADE_SNAPSHOT/firewall.uci"
+	ZT_UPGRADE_SNAPSHOT="$(mktemp -d /tmp/zrs-transport-rollback.XXXXXX)" || return 1
+	cp -p /etc/config/zerotier "$ZT_UPGRADE_SNAPSHOT/zerotier.uci" || return 1
+	cp -p /etc/config/firewall "$ZT_UPGRADE_SNAPSHOT/firewall.uci" || return 1
 	old_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
-	printf '%s\n' "$old_local_conf" > "$ZT_UPGRADE_SNAPSHOT/local-conf-path"
+	printf '%s\n' "$old_local_conf" > "$ZT_UPGRADE_SNAPSHOT/local-conf-path" || return 1
 	if [ -n "$old_local_conf" ] && [ -f "$old_local_conf" ]; then
-		cp -p "$old_local_conf" "$ZT_UPGRADE_SNAPSHOT/local-conf"
+		cp -p "$old_local_conf" "$ZT_UPGRADE_SNAPSHOT/local-conf" || return 1
 	fi
-	[ -f "$ZT_SUPPORT_LOCAL_CONF" ] && cp -p "$ZT_SUPPORT_LOCAL_CONF" "$ZT_UPGRADE_SNAPSHOT/support-local-conf" || true
-	[ -f "$ZT_BYPASS_FILE" ] && cp -p "$ZT_BYPASS_FILE" "$ZT_UPGRADE_SNAPSHOT/bypass.nft" || true
+	if [ -f "$ZT_SUPPORT_LOCAL_CONF" ]; then
+		cp -p "$ZT_SUPPORT_LOCAL_CONF" "$ZT_UPGRADE_SNAPSHOT/support-local-conf" || return 1
+	fi
+	if [ -f "$ZT_BYPASS_FILE" ]; then
+		cp -p "$ZT_BYPASS_FILE" "$ZT_UPGRADE_SNAPSHOT/bypass.nft" || return 1
+	fi
 
 	ZT_UPGRADE_NETWORK_IDS="$(configured_network_ids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 	ZT_UPGRADE_WAS_READY=0
@@ -287,23 +294,23 @@ restore_snapshot_file() {
 	backup_name="$1"
 	target_path="$2"
 	if [ -f "$ZT_UPGRADE_SNAPSHOT/$backup_name" ]; then
-		cp -p "$ZT_UPGRADE_SNAPSHOT/$backup_name" "$target_path"
+		cp -p "$ZT_UPGRADE_SNAPSHOT/$backup_name" "$target_path" || return 1
 	else
-		rm -f "$target_path"
+		rm -f "$target_path" || return 1
 	fi
 }
 
 restore_transport_snapshot() {
 	[ -n "$ZT_UPGRADE_SNAPSHOT" ] && [ -d "$ZT_UPGRADE_SNAPSHOT" ] || return 1
-	cp -p "$ZT_UPGRADE_SNAPSHOT/zerotier.uci" /etc/config/zerotier
-	cp -p "$ZT_UPGRADE_SNAPSHOT/firewall.uci" /etc/config/firewall
-	old_local_conf="$(cat "$ZT_UPGRADE_SNAPSHOT/local-conf-path")"
+	cp -p "$ZT_UPGRADE_SNAPSHOT/zerotier.uci" /etc/config/zerotier || return 1
+	cp -p "$ZT_UPGRADE_SNAPSHOT/firewall.uci" /etc/config/firewall || return 1
+	old_local_conf="$(cat "$ZT_UPGRADE_SNAPSHOT/local-conf-path")" || return 1
 	if [ -n "$old_local_conf" ] && [ -f "$ZT_UPGRADE_SNAPSHOT/local-conf" ]; then
-		cp -p "$ZT_UPGRADE_SNAPSHOT/local-conf" "$old_local_conf"
+		cp -p "$ZT_UPGRADE_SNAPSHOT/local-conf" "$old_local_conf" || return 1
 	fi
-	restore_snapshot_file support-local-conf "$ZT_SUPPORT_LOCAL_CONF"
-	restore_snapshot_file bypass.nft "$ZT_BYPASS_FILE"
-	/etc/init.d/firewall reload || /etc/init.d/firewall restart
+	restore_snapshot_file support-local-conf "$ZT_SUPPORT_LOCAL_CONF" || return 1
+	restore_snapshot_file bypass.nft "$ZT_BYPASS_FILE" || return 1
+	/etc/init.d/firewall reload || /etc/init.d/firewall restart || return 1
 }
 
 cleanup_transport_snapshot() {
@@ -355,8 +362,8 @@ restart_and_verify_transport() {
 }
 
 install_or_upgrade() {
-	pm_install_zerotier
-	snapshot_transport_state
+	pm_install_zerotier || return 1
+	snapshot_transport_state || { cleanup_transport_snapshot; return 1; }
 	if ! ensure_transport_independence || ! ensure_firewall; then
 		echo "Обновление не применилось; выполняется автоматический откат." >&2
 		restore_transport_snapshot || true
@@ -385,45 +392,65 @@ install_or_upgrade() {
 	status
 }
 
+configure_network_apply() {
+	network_id="$1"
+	uci set zerotier.global=zerotier || return 1
+	uci set zerotier.global.enabled='1' || return 1
+	uci -q delete zerotier.earth || true
+	uci -q delete "zerotier.${NETWORK_SECTION}" || true
+	uci set "zerotier.${NETWORK_SECTION}=network" || return 1
+	uci set "zerotier.${NETWORK_SECTION}.id=${network_id}" || return 1
+	uci set "zerotier.${NETWORK_SECTION}.allow_managed=1" || return 1
+	uci set "zerotier.${NETWORK_SECTION}.allow_global=0" || return 1
+	uci set "zerotier.${NETWORK_SECTION}.allow_default=0" || return 1
+	uci set "zerotier.${NETWORK_SECTION}.allow_dns=0" || return 1
+	ensure_transport_independence || return 1
+	ensure_firewall || return 1
+	/etc/init.d/zerotier enable || return 1
+	/etc/init.d/zerotier restart || return 1
+	sleep 5
+	return 0
+}
+
 configure_network() {
 	network_id="$1"
-
 	if ! is_hex16 "$network_id"; then
 		echo "Неверный Network ID. Нужно 16 символов HEX, например 0123456789abcdef." >&2
 		return 2
 	fi
-
-	pm_install_zerotier
-
-	uci set zerotier.global=zerotier
-	uci set zerotier.global.enabled='1'
-	uci -q delete zerotier.earth || true
-	uci -q delete "zerotier.${NETWORK_SECTION}" || true
-	uci set "zerotier.${NETWORK_SECTION}=network"
-	uci set "zerotier.${NETWORK_SECTION}.id=${network_id}"
-	uci set "zerotier.${NETWORK_SECTION}.allow_managed=1"
-	uci set "zerotier.${NETWORK_SECTION}.allow_global=0"
-	uci set "zerotier.${NETWORK_SECTION}.allow_default=0"
-	uci set "zerotier.${NETWORK_SECTION}.allow_dns=0"
-	ensure_transport_independence
-	ensure_firewall
-
-	/etc/init.d/zerotier enable
-	/etc/init.d/zerotier restart
-	sleep 5
+	pm_install_zerotier || return 1
+	snapshot_transport_state || { cleanup_transport_snapshot; return 1; }
+	if ! configure_network_apply "$network_id"; then
+		uci -q revert zerotier || true
+		uci -q revert firewall || true
+		if ! restore_transport_snapshot; then
+			echo "Не удалось полностью восстановить конфигурацию. Проверьте доступ к роутеру." >&2
+			cleanup_transport_snapshot
+			return 1
+		fi
+		/etc/init.d/zerotier restart || true
+		cleanup_transport_snapshot
+		echo "Сеть не сохранена; прежние настройки восстановлены." >&2
+		return 1
+	fi
+	cleanup_transport_snapshot
 
 	status
 }
 
 leave_network() {
-	network_id="${1:-$(uci -q get "zerotier.${NETWORK_SECTION}.id" || true)}"
-	if [ -n "$network_id" ] && command -v zerotier-cli >/dev/null 2>&1; then
-		zerotier-cli leave "$network_id" || true
-	fi
+	saved_network_id="$(uci -q get "zerotier.${NETWORK_SECTION}.id" || true)"
+	[ -n "$saved_network_id" ] || { echo "Сохранённая сеть ZeroTier не найдена." >&2; return 1; }
+	[ -z "${1:-}" ] || [ "$1" = "$saved_network_id" ] || {
+		echo "Network ID отличается от сохранённой сети. Обновите страницу." >&2
+		return 2
+	}
+	command -v zerotier-cli >/dev/null 2>&1 || return 1
+	zerotier-cli leave "$saved_network_id" || return 1
 
-	uci -q delete "zerotier.${NETWORK_SECTION}" || true
-	uci commit zerotier
-	ensure_transport_independence
+	uci -q delete "zerotier.${NETWORK_SECTION}" || return 1
+	uci commit zerotier || return 1
+	ensure_transport_independence || return 1
 	/etc/init.d/zerotier restart || true
 	status
 }
@@ -714,7 +741,7 @@ print_technical_details() {
 
 	echo
 	echo "-- zerotier config без секрета --"
-	uci -q show zerotier 2>/dev/null | sed "s/^zerotier\.global\.secret=.*/zerotier.global.secret='<hidden>'/" || true
+	uci -q show zerotier 2>/dev/null | sed "s/^\(zerotier\.[^.=]*\.secret\)=.*/\1='<hidden>'/" || true
 
 	echo
 	echo "-- zt interfaces --"

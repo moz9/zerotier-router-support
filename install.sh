@@ -15,6 +15,7 @@ FILES=(
   "openwrt/usr/share/rpcd/acl.d/zerotier-support.json"
   "openwrt/usr/share/luci/menu.d/zerotier-support.json"
   "openwrt/www/luci-static/resources/view/services/zerotier.js"
+  "openwrt/lib/upgrade/keep.d/zerotier-router-support"
 )
 
 need_cmd() {
@@ -84,8 +85,11 @@ ROUTER_PORT="${ROUTER_PORT:-22}"
 printf "Пароль root для %s (оставьте пустым, если ключ уже установлен): " "$ROUTER_HOST"
 if [ -t 0 ]; then
   stty -echo
+  trap 'stty echo; exit 130' INT TERM
+  trap 'stty echo' EXIT
   IFS= read -r ROUTER_PASS || true
   stty echo
+  trap - INT TERM EXIT
 else
   IFS= read -r ROUTER_PASS || true
 fi
@@ -109,12 +113,18 @@ expect {
   eof {}
   timeout { exit 2 }
 }
-spawn scp -O -P $env(ROUTER_PORT) -r -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$env(KNOWN_HOSTS) $env(PAYLOAD_DIR)/* root@$env(ROUTER_HOST):/tmp/zrs-files/
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { exit 1 }
+set files [glob -nocomplain -directory $env(PAYLOAD_DIR) *]
+if {[llength $files] == 0} { exit 1 }
+spawn scp -O -P $env(ROUTER_PORT) -r -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$env(KNOWN_HOSTS) {*}$files root@$env(ROUTER_HOST):/tmp/zrs-files/
 expect {
   -re "(?i)password:" { send -- "$password\r"; exp_continue }
   eof {}
   timeout { exit 2 }
 }
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { exit 1 }
 EXPECT
 }
 
@@ -123,14 +133,14 @@ run_expect_ssh_password() {
   expect <<'EXPECT'
 set timeout 420
 set password $env(ROUTER_PASS)
-spawn ssh -p $env(ROUTER_PORT) -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$env(KNOWN_HOSTS) root@$env(ROUTER_HOST) "sh /tmp/zrs-files/router-install.sh /tmp/zrs-files; echo __ZRS_DONE__"
+spawn ssh -p $env(ROUTER_PORT) -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$env(KNOWN_HOSTS) root@$env(ROUTER_HOST) "sh /tmp/zrs-files/router-install.sh /tmp/zrs-files"
 expect {
-  -re "(?i)password:" { send -- "$password\r" }
-  eof { exit 1 }
+  -re "(?i)password:" { send -- "$password\r"; exp_continue }
+  eof {}
   timeout { exit 2 }
 }
-expect "__ZRS_DONE__"
-expect eof
+set result [wait]
+if {[lindex $result 2] != 0 || [lindex $result 3] != 0} { exit 1 }
 EXPECT
 }
 
@@ -156,7 +166,7 @@ run_ssh_key() {
     -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new \
     -o UserKnownHostsFile="$KNOWN_HOSTS" \
-    "root@${ROUTER_HOST}" "sh /tmp/zrs-files/router-install.sh /tmp/zrs-files; echo __ZRS_DONE__"
+    "root@${ROUTER_HOST}" "sh /tmp/zrs-files/router-install.sh /tmp/zrs-files"
 }
 
 echo

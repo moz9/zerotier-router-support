@@ -60,10 +60,10 @@ function outputText(result) {
 }
 
 function parseCurrentNetworkId(output) {
-	var match = String(output || '').match(/Network ID:\s*([0-9a-fA-F]{16})/);
+	var match = String(output || '').match(/zerotier\.router_support\.id='([0-9a-fA-F]{16})'/);
 	if (match) return match[1];
 
-	match = String(output || '').match(/zerotier\.router_support\.id='([0-9a-fA-F]{16})'/);
+	match = String(output || '').match(/Network ID:\s*([0-9a-fA-F]{16})/);
 	return match ? match[1] : '';
 }
 
@@ -91,17 +91,31 @@ function actionGroup(items) {
 	return E('div', { 'class': 'zrs-actions' }, items);
 }
 
+function confirmDisconnect(title, warning, action) {
+	ui.showModal(title, [
+		E('p', {}, warning),
+		E('div', { 'class': 'right' }, [
+			E('button', { 'class': 'btn', 'click': function() { ui.hideModal(); } }, _('Отмена')),
+			E('button', { 'class': 'btn cbi-button-negative', 'click': function() {
+				ui.hideModal();
+				action();
+			} }, _('Отключить'))
+		])
+	]);
+}
+
 return view.extend({
 	load: function() {
 		return L.resolveDefault(callStatus(), {});
 	},
 
 	render: function(data) {
+		var savedNetworkId = parseCurrentNetworkId(outputText(data));
 		var networkInput = E('input', {
 			'class': 'cbi-input-text zrs-input',
 			'type': 'text',
 			'placeholder': '0123456789abcdef',
-			'value': parseCurrentNetworkId(outputText(data)),
+			'value': savedNetworkId,
 			'maxlength': '16',
 			'autocapitalize': 'none',
 			'autocomplete': 'off',
@@ -176,6 +190,8 @@ return view.extend({
 
 		function update(result, message) {
 			output.textContent = outputText(result);
+			if (result && result.success !== false)
+				savedNetworkId = parseCurrentNetworkId(output.textContent);
 			if (message) notify(result, message);
 		}
 
@@ -218,12 +234,19 @@ return view.extend({
 		});
 
 		leaveButton.addEventListener('click', function() {
-			var networkId = String(networkInput.value || '').trim();
-			run(leaveButton, callLeave(networkId), _('Роутер отключен от сети ZeroTier'));
+			if (!savedNetworkId) {
+				ui.addNotification(null, E('p', _('Сохранённая сеть ZeroTier не найдена. Обновите страницу.')), 'danger');
+				return;
+			}
+			confirmDisconnect(_('Отключить от сети ZeroTier?'),
+				_('Удалённый доступ через эту сеть может сразу пропасть. Проверьте запасной способ входа на роутер.'),
+				function() { run(leaveButton, callLeave(savedNetworkId), _('Роутер отключен от сети ZeroTier')); });
 		});
 
 		disableButton.addEventListener('click', function() {
-			run(disableButton, callDisable(), _('ZeroTier выключен'));
+			confirmDisconnect(_('Выключить ZeroTier?'),
+				_('Удалённый доступ через ZeroTier может сразу пропасть. Проверьте запасной способ входа на роутер.'),
+				function() { run(disableButton, callDisable(), _('ZeroTier выключен')); });
 		});
 
 		diagnoseButton.addEventListener('click', function() {

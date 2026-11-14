@@ -10,6 +10,7 @@ RPC_ACL_DIR="${ZRS_RPC_ACL_DIR:-/usr/share/rpcd/acl.d}"
 LUCI_MENU_DIR="${ZRS_LUCI_MENU_DIR:-/usr/share/luci/menu.d}"
 LUCI_VIEW_BASE="${ZRS_LUCI_VIEW_BASE:-/www/luci-static/resources/view}"
 LUCI_VIEW_DIR="${LUCI_VIEW_BASE}/services"
+KEEP_DIR="${ZRS_KEEP_DIR:-/lib/upgrade/keep.d}"
 
 if [ ! -d "$OVERLAY_DIR" ]; then
 	echo "Missing OpenWrt overlay directory: $OVERLAY_DIR" >&2
@@ -31,37 +32,52 @@ cat /etc/openwrt_release 2>/dev/null || true
 ubus call system board 2>/dev/null || true
 
 echo "== Backup =="
+umask 077
 ts="$(date +%Y%m%d-%H%M%S)"
-backup_dir="/tmp/zt-support-backup-${ts}"
+backup_dir="$(mktemp -d /tmp/zt-support-backup.XXXXXX)" || exit 1
+case "$backup_dir" in /tmp/zt-support-backup.??????) ;; *) echo "Небезопасный путь резервной копии" >&2; exit 1 ;; esac
 mkdir -p "${backup_dir}/config" "${backup_dir}/transport"
 sysupgrade -b "${backup_dir}/openwrt-config-before-zerotier-support-${ts}.tar.gz" >/dev/null
 for f in network firewall dropbear zerotier; do
-	[ -e "/etc/config/${f}" ] && cp "/etc/config/${f}" "${backup_dir}/config/${f}" || true
+	if [ -e "/etc/config/${f}" ]; then
+		cp "/etc/config/${f}" "${backup_dir}/config/${f}"
+	fi
 done
 for f in /etc/zerotier-router-support.conf /etc/nftables.d/20-podkop-zerotier-bypass.nft; do
-	[ -e "$f" ] && cp -p "$f" "${backup_dir}/transport/$(basename "$f")" || true
+	if [ -e "$f" ]; then
+		cp -p "$f" "${backup_dir}/transport/$(basename "$f")"
+	fi
 done
 existing_local_conf="$(uci -q get zerotier.global.local_conf_path 2>/dev/null || true)"
 if [ -n "$existing_local_conf" ] && [ -f "$existing_local_conf" ]; then
 	cp -p "$existing_local_conf" "${backup_dir}/transport/existing-local.conf"
 	printf '%s\n' "$existing_local_conf" > "${backup_dir}/transport/existing-local-conf-path"
 fi
-tar -czf "/tmp/zt-support-backup-${ts}.tar.gz" -C "${backup_dir}" .
-printf '%s\n' "/tmp/zt-support-backup-${ts}.tar.gz" > /tmp/zt-support-last-backup-path
-echo "BACKUP_FILE=/tmp/zt-support-backup-${ts}.tar.gz"
+backup_archive="/tmp/zt-support-backup-${ts}-$$.zrs.tar.gz"
+tar -czf "$backup_archive" -C "$backup_dir" .
+rm -rf "$backup_dir"
+printf '%s\n' "$backup_archive" > /tmp/zt-support-last-backup-path
+echo "BACKUP_FILE=$backup_archive"
+# Keep three recent archives created by this installer. Older formats are untouched.
+ls -1t /tmp/zt-support-backup-*.zrs.tar.gz 2>/dev/null | sed -n '4,$p' | while IFS= read -r old_archive; do
+	case "$old_archive" in /tmp/zt-support-backup-*.zrs.tar.gz) rm -f "$old_archive" ;; esac
+done
 
 echo "== Install ZeroTier package =="
-if command -v zerotier-cli >/dev/null 2>&1; then
-	echo "ZeroTier already installed."
-elif command -v apk >/dev/null 2>&1; then
-	apk update || true
-	apk add zerotier
-elif command -v opkg >/dev/null 2>&1; then
-	opkg update
-	opkg install zerotier
-else
-	echo "No supported package manager found: expected apk or opkg." >&2
-	exit 1
+install_packages=""
+command -v zerotier-cli >/dev/null 2>&1 || install_packages=zerotier
+command -v jq >/dev/null 2>&1 || install_packages="${install_packages:+$install_packages }jq"
+if [ -n "$install_packages" ]; then
+	if command -v apk >/dev/null 2>&1; then
+		apk update || true
+		apk add $install_packages
+	elif command -v opkg >/dev/null 2>&1; then
+		opkg update
+		opkg install $install_packages
+	else
+		echo "No supported package manager found: expected apk or opkg." >&2
+		exit 1
+	fi
 fi
 
 echo "== Detect LuCI and rpcd paths =="
@@ -71,7 +87,7 @@ if [ ! -d "$LUCI_MENU_DIR" ] || [ ! -d "$LUCI_VIEW_BASE" ]; then
 	exit 1
 fi
 
-mkdir -p "$HELPER_DIR" "$RPC_UCODE_DIR" "$RPC_ACL_DIR" "$LUCI_MENU_DIR" "$LUCI_VIEW_DIR"
+mkdir -p "$HELPER_DIR" "$RPC_UCODE_DIR" "$RPC_ACL_DIR" "$LUCI_MENU_DIR" "$LUCI_VIEW_DIR" "$KEEP_DIR"
 echo "HELPER_DIR=$HELPER_DIR"
 echo "RPC_UCODE_DIR=$RPC_UCODE_DIR"
 echo "RPC_ACL_DIR=$RPC_ACL_DIR"
@@ -86,6 +102,7 @@ cp "${OVERLAY_DIR}/usr/share/rpcd/ucode/zerotier.support" "${RPC_UCODE_DIR}/zero
 cp "${OVERLAY_DIR}/usr/share/rpcd/acl.d/zerotier-support.json" "${RPC_ACL_DIR}/zerotier-support.json"
 cp "${OVERLAY_DIR}/usr/share/luci/menu.d/zerotier-support.json" "${LUCI_MENU_DIR}/zerotier-support.json"
 cp "${OVERLAY_DIR}/www/luci-static/resources/view/services/zerotier.js" "${LUCI_VIEW_DIR}/zerotier.js"
+cp "${OVERLAY_DIR}/lib/upgrade/keep.d/zerotier-router-support" "${KEEP_DIR}/zerotier-router-support"
 
 chmod 0755 "${HELPER_DIR}/helper"
 chmod 0644 "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
@@ -94,6 +111,7 @@ chmod 0644 "${RPC_UCODE_DIR}/zerotier.support"
 chmod 0644 "${RPC_ACL_DIR}/zerotier-support.json"
 chmod 0644 "${LUCI_MENU_DIR}/zerotier-support.json"
 chmod 0644 "${LUCI_VIEW_DIR}/zerotier.js"
+chmod 0644 "${KEEP_DIR}/zerotier-router-support"
 rm -f "${LUCI_VIEW_BASE}/system/zerotier-support.js" 2>/dev/null || true
 
 echo "== SSH support key =="
@@ -117,7 +135,6 @@ echo "== Prepare firewall =="
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart 2>/dev/null || true
-/etc/init.d/dropbear restart 2>/dev/null || true
 
 echo
 echo "Панель ZeroTier-поддержки установлена."

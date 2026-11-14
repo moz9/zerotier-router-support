@@ -43,6 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/moz9/zerotier-router-support/main/r
 
 Скрипт сам определяет `apk` или `opkg`, сохраняет существующие Network ID и параметры сети. При обновлении он заранее защищает текущие UDP-порты, при необходимости кратко перезапускает только ZeroTier, проверяет возврат существующих виртуальных сетей и автоматически откатывает транспорт при ошибке. Роутер не перезагружается.
 
+Файлы панели и настройки транспорта включены в список сохранения `sysupgrade`. После обновления прошивки проверьте, что пакет `zerotier` установлен, затем откройте панель и проверьте статус. Для повторной установки используйте команду выше. Для фиксированной версии можно задать `ZRS_BASE_URL` с URL тега или коммита; это не позволит смешать файлы разных ревизий при загрузке.
+
 При первой установке после выполнения команды откройте LuCI: **Службы -> ZeroTier**, введите Network ID и авторизуйте роутер в ZeroTier Central.
 
 ### С Mac на роутер по SSH
@@ -97,6 +99,7 @@ rm -f \
   /usr/share/rpcd/acl.d/zerotier-support.json \
   /usr/share/luci/menu.d/zerotier-support.json \
   /www/luci-static/resources/view/services/zerotier.js \
+  /lib/upgrade/keep.d/zerotier-router-support \
   /www/luci-static/resources/view/system/zerotier-support.js
 rmdir /usr/libexec/zerotier-support 2>/dev/null || true
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache

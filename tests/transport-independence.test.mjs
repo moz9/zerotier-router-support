@@ -50,10 +50,21 @@ test("helper applies the bypass before firewall reload and before every ZeroTier
   assert.match(helper, /zerotier\.global\.local_conf_path/);
   assert.match(helper, /\/etc\/nftables\.d\/20-podkop-zerotier-bypass\.nft/);
 
-  const configure = helper.match(/configure_network\(\)\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
+  const configure = helper.match(/configure_network_apply\(\)\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
   const restart = helper.match(/restart_service\(\)\s*\{[\s\S]*?\n\}/)?.[0] ?? "";
   assert.ok(configure.indexOf("ensure_transport_independence") < configure.indexOf("/etc/init.d/zerotier restart"));
   assert.ok(restart.indexOf("ensure_transport_independence") < restart.indexOf("/etc/init.d/zerotier restart"));
+});
+
+test("sysupgrade retention and both installers include the same support files", () => {
+  const keepPath = "openwrt/lib/upgrade/keep.d/zerotier-router-support";
+  const keep = read(keepPath);
+  for (const file of ["/etc/zerotier.conf", "/etc/zerotier-router-support.conf", "/etc/nftables.d/20-podkop-zerotier-bypass.nft", "/usr/libexec/zerotier-support/helper"]) {
+    assert.ok(keep.includes(file), `retention list omits ${file}`);
+  }
+  assert.ok(read("install.sh").includes(keepPath));
+  assert.ok(read("router-direct-install.sh").includes(keepPath));
+  assert.ok(read("router-install.sh").includes('${OVERLAY_DIR}/lib/upgrade/keep.d/zerotier-router-support'));
 });
 
 test("upgrade protects the currently random ports before the next ZeroTier restart", () => {

@@ -7,7 +7,9 @@ TMP_DIR="$(mktemp -d /tmp/zrs-direct.XXXXXX)"
 cleanup() {
 	rm -rf "$TMP_DIR"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 need_root() {
 	if [ "$(id -u)" != 0 ]; then
@@ -57,6 +59,7 @@ fetch_file "openwrt/usr/share/rpcd/ucode/zerotier.support"
 fetch_file "openwrt/usr/share/rpcd/acl.d/zerotier-support.json"
 fetch_file "openwrt/usr/share/luci/menu.d/zerotier-support.json"
 fetch_file "openwrt/www/luci-static/resources/view/services/zerotier.js"
+fetch_file "openwrt/lib/upgrade/keep.d/zerotier-router-support"
 
 if [ -n "${ZRS_PUBKEY:-}" ]; then
 	printf '%s\n' "$ZRS_PUBKEY" > "${TMP_DIR}/router-support-ed25519.pub"

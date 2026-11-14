@@ -7,13 +7,7 @@
           "status",
           "diagnose"
         ]
-      },
-      "uci": [
-        "zerotier",
-        "firewall",
-        "dropbear",
-        "podkop"
-      ]
+      }
     },
     "write": {
       "ubus": {
@@ -25,11 +19,7 @@
           "disable",
           "diagnose"
         ]
-      },
-      "uci": [
-        "zerotier",
-        "firewall"
-      ]
+      }
     }
   }
 }
