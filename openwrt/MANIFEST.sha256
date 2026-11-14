@@ -1,0 +1,13 @@
+# zerotier-router-support 2026.11.14
+33be9fa4c31bb8fd0398fc087020af6d99a5a0d83f6753d82efaa6d73e2b5b5a  router-install.sh
+7df7d5610b961cd0992e24ba792bd5df65f74dc292565037c0669598ec5d09bf  openwrt/usr/libexec/zerotier-support/helper
+d5d1fbbd0d19037008653209547b831ce40c6768812838c88c5cc05dabdce42a  openwrt/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft
+88471c2b07d4130c3ef93e30871c55f5f8d18edf4cf13e6f16baa23a35751bcf  openwrt/usr/libexec/zerotier-support/zerotier-router-support.conf
+b514b0984ced1339ca6904b825cfec32ff51d1fa6f10022316cfdc4d5849decb  openwrt/usr/share/rpcd/ucode/zerotier.support
+683448eae5aeb375272769dc496a3c58f1c01ba3c6c833080cdca513bb18449b  openwrt/usr/share/rpcd/acl.d/zerotier-support.json
+826cca3fef925b8205232a9e098f9b22bcfb755318ed2b1fbe46d51d4309d6d5  openwrt/usr/share/luci/menu.d/zerotier-support.json
+b02f2008ae955e86284b4fecb5e154c1c2cf41c617c00a6424ffc6602d90e655  openwrt/www/luci-static/resources/view/services/zerotier.js
+9c15c99b7d170b028afbead72fa3b6999a88e4c4b83c3de26b02ae0a7cf667f6  openwrt/lib/upgrade/keep.d/zerotier-router-support
+baf394cd4fb0a54c0d602fffa729455014f7ab2f5a92e359f1d40188ff4c2c32  openwrt/usr/libexec/zerotier-support/guard
+31b964f4a88142cd0abc35f4c7df1615f0b5a3e1d478c63f953b4f5f7ee8cbd9  openwrt/etc/init.d/zerotier-guard
+c8b0a385e611a0b05a1180e252393db5ad04af2ff4a2bd7b90b1a8431a30895b  openwrt/lib/upgrade/keep.d/zerotier-guard

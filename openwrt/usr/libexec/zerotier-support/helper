@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# The version of the whole support package. It changes with every release, so the helper's checksum does too:
+# A management tool that compares the files on a router with the published ones then sees an update.
+ZRS_VERSION="2026.11.14"
 NETWORK_SECTION="router_support"
 FW_ZONE="zt_support"
 FW_RULE="allow_zt_support_router"
@@ -729,6 +732,7 @@ print_friendly_report() {
 print_technical_details() {
 	echo
 	echo "== Технические детали =="
+	printf 'Пакет поддержки ZeroTier: версия %s\n' "$ZRS_VERSION"
 	if [ "$zt_installed" = 1 ]; then
 		echo "-- zerotier-cli info --"
 		printf '%s\n' "$zt_info"
@@ -758,9 +762,16 @@ print_technical_details() {
 	uci -q show "firewall.${FW_RULE}" || true
 }
 
+print_guard_report() {
+	[ -x /usr/libexec/zerotier-support/guard ] || return 0
+	echo
+	/usr/libexec/zerotier-support/guard status 6 2>/dev/null || true
+}
+
 status() {
 	collect_state
 	print_friendly_report
+	print_guard_report
 	print_technical_details
 }
 
@@ -824,8 +835,11 @@ case "${1:-status}" in
 	status)
 		status
 		;;
+	version)
+		echo "$ZRS_VERSION"
+		;;
 	*)
-		echo "Usage: $0 {status|install|configure <network-id>|leave [network-id]|disable|restart|diagnose [target]}" >&2
+		echo "Usage: $0 {status|install|configure <network-id>|leave [network-id]|disable|restart|diagnose [target]|version}" >&2
 		exit 2
 		;;
 esac

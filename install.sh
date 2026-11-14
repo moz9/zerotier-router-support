@@ -16,6 +16,10 @@ FILES=(
   "openwrt/usr/share/luci/menu.d/zerotier-support.json"
   "openwrt/www/luci-static/resources/view/services/zerotier.js"
   "openwrt/lib/upgrade/keep.d/zerotier-router-support"
+  "openwrt/usr/libexec/zerotier-support/guard"
+  "openwrt/etc/init.d/zerotier-guard"
+  "openwrt/lib/upgrade/keep.d/zerotier-guard"
+  "openwrt/MANIFEST.sha256"
 )
 
 need_cmd() {

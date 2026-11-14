@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lab stand-in for "sysupgrade -b <file>": a small archive of the settings, as the installer's backup step expects.
+[ "${1:-}" = -b ] && tar -czf "$2" -C / etc/config 2>/dev/null
+exit 0

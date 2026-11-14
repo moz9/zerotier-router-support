@@ -1,0 +1,11 @@
+#!/bin/sh
+# Lab stand-in for nft (qemu cannot pass nftables' netlink through): answers as a router whose firewall state is in
+# place, and writes down what it was asked to change.
+case "$*" in
+	"list chain inet fw4 podkop_zerotier_bypass"|"list set inet fw4 podkop_zerotier_udp_ports") exit 0 ;;
+	"list chain inet fw4 input_zt_support") echo 'tcp dport { 22, 80, 443 } counter accept comment "!fw4: Allow-ZeroTier-Support-To-Router"' ;;
+	"list table inet PodkopTable") exit 1 ;;
+	-c*) exit 0 ;;
+	-f*) echo "$(date +%H:%M:%S) nft $*" >> /tmp/lab/nft-calls ;;
+	*) exit 1 ;;
+esac

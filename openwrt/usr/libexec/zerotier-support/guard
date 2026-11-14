@@ -1,0 +1,908 @@
+#!/bin/sh
+# ZeroTier access guard.
+#
+# Keeps the remote door of this router open by itself:
+#   - watches the ZeroTier daemon (alive, ONLINE, network OK, address present, a root server reachable);
+#   - repairs by steps with back-off (a reboot only when switched on: REBOOT=1): restart the service -> re-apply the app's own live firewall state
+#     -> pause Podkop for a few minutes (its own init script only) -> one reboot, rarely;
+#   - keeps the last known network settings on flash and puts them back when the controller does not answer;
+#   - after a firmware upgrade waits for the administrator's PC to confirm that it got in, and walks the same
+#     steps once if nobody does.
+#
+# It never changes settings: no uci set/commit, no package, no file of another program. The only files it writes
+# are its own: /tmp/zerotier-support/ (RAM) and /etc/zerotier-support/ (flash, small, written on change).
+# It cannot help when the router does not boot or its WAN stays down.
+#
+# BusyBox ash, OpenWrt 24.10 (opkg) and 25.12 (apk). No timeout, stat or fractional sleep there.
+set -u
+
+GUARD_VERSION="2026.11.14"                   # the support package's version (same as in the helper)
+R="${ZRS_GUARD_ROOT:-}"                      # tests only: a prefix for every absolute path
+FLASH="$R/etc/zerotier-support"
+RAM="$R/tmp/zerotier-support"
+ZT_HOME="$R/var/lib/zerotier-one"
+INITD="$R/etc/init.d"
+STATE="$RAM/guard.state"
+LOG="$RAM/guard.log"
+OUT="$RAM/.out.$$"
+LOCK="$RAM/guard.pid"
+INCIDENT="$FLASH/last-incident"
+REBOOTS="$FLASH/reboots"
+PENDING="$FLASH/upgrade-pending"
+CONF="$FLASH/guard.conf"
+BYPASS_FILE="$R/etc/nftables.d/20-podkop-zerotier-bypass.nft"
+BYPASS_TEMPLATE="$R/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
+FW_ZONE="zt_support"
+FW_RULE="allow_zt_support_router"
+FW_RULE_NAME="Allow-ZeroTier-Support-To-Router"
+ZT_PORTS="9993 25534 34923"
+
+# ---- what can be tuned in /etc/zerotier-support/guard.conf (plain NAME=number lines; the guard never writes it)
+INTERVAL=60            # seconds between checks
+FAIL_RESTART=180       # unhealthy this long -> restart the ZeroTier service
+FAIL_REAPPLY=360       # -> re-apply the bypass file and the live firewall state
+FAIL_PODKOP=720        # -> pause Podkop
+PODKOP=1               # 0: never touch Podkop
+PODKOP_PAUSE=300       # for how long
+PODKOP_GAP=21600       # and not again sooner than this
+FAIL_REBOOT=1800       # unhealthy this long -> reboot, if allowed
+REBOOT=0               # 1: allow the reboot step. Off by default (the owner's decision, 2026-11-14: routers that drop
+                       # out usually come back by themselves, and a reboot loses the RAM log that tells why)
+REBOOT_MIN_UPTIME=1800 # no reboot before the router has been up this long
+REBOOT_GAP=21600       # after a guard reboot the next one needs this much uptime; doubles each time, 24 h at most
+RESTART_GAP=360        # gap after the first restart; doubles each time, RESTART_GAP_MAX at most
+RESTART_GAP_MAX=3600
+CONFIRM=900            # after a firmware upgrade: seconds of uptime to wait for the PC's confirmation
+CACHE=1                # 0: do not keep network settings on flash
+CACHE_REFRESH=600      # refresh the kept settings this often (the pass inside them goes stale otherwise)
+CACHE_MIN_GAP=300      # never write them more often than this, whatever changes
+CACHE_MAX_AGE=604800   # kept settings older than this are not put back
+SEED_AFTER=120         # network without settings this long -> put the kept ones back
+SEED_MAX=4             # at most this many times per boot
+CONTROLLER_SILENT=900  # the controller has not refreshed the network settings this long -> the pass is going stale
+CONTROLLER_RESTART=1   # 0: only notice and record it; 1: give the daemon one fresh start
+CONTROLLER_RETRY=7200  # and the next such start not sooner than this
+HISTORY_GAP=600        # the history of incidents is written to flash at most this often (lines wait in RAM meanwhile)
+GRACE=90               # a daemon that has just been started gets this long before the next step
+BOOT_GRACE=300         # no repair step in the first minutes after a boot: WAN and ZeroTier are still coming up
+CLI_TIMEOUT=10         # seconds for one zerotier-cli call
+
+load_conf() {
+	[ -f "$CONF" ] || return 0
+	while IFS='=' read -r lc_k lc_v; do
+		case "$lc_k" in
+			INTERVAL|FAIL_RESTART|FAIL_REAPPLY|FAIL_PODKOP|PODKOP|PODKOP_PAUSE|PODKOP_GAP|FAIL_REBOOT|REBOOT|REBOOT_MIN_UPTIME|REBOOT_GAP|RESTART_GAP|RESTART_GAP_MAX|CONFIRM|CACHE|CACHE_REFRESH|CACHE_MIN_GAP|CACHE_MAX_AGE|SEED_AFTER|SEED_MAX|GRACE|BOOT_GRACE|CONTROLLER_SILENT|CONTROLLER_RESTART|CONTROLLER_RETRY|HISTORY_GAP|CLI_TIMEOUT) ;;
+			*) continue ;;
+		esac
+		lc_v="$(printf '%s' "$lc_v" | tr -d ' \r')"
+		case "$lc_v" in ''|*[!0-9]*) continue ;; esac
+		eval "$lc_k=$lc_v"
+	done < "$CONF"
+}
+
+# ---------------------------------------------------------------- time, log, small tools
+now_up() {
+	if [ -n "${ZRS_GUARD_UPTIME:-}" ]; then echo "$ZRS_GUARD_UPTIME"; return; fi
+	cut -d. -f1 /proc/uptime 2>/dev/null || echo 0
+}
+now_epoch() { if [ -n "${ZRS_GUARD_EPOCH:-}" ]; then echo "$ZRS_GUARD_EPOCH"; else date +%s; fi; }
+stamp() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+num() { case "${1:-}" in ''|*[!0-9]*) echo "${2:-0}" ;; *) echo "$1" ;; esac; }
+fsize() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
+
+log() {
+	mkdir -p "$RAM" 2>/dev/null
+	printf '%s %s\n' "$(stamp)" "$*" >> "$LOG" 2>/dev/null
+	if [ "$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')" -gt 400 ] 2>/dev/null; then
+		tail -n 300 "$LOG" > "$LOG.new" 2>/dev/null && mv "$LOG.new" "$LOG"
+	fi
+	have logger && logger -t zerotier-guard "$*" 2>/dev/null
+	return 0
+}
+
+# run a command with a time limit; its output goes to $OUT (BusyBox here has no timeout applet)
+tcall() {
+	tc_t="$1"; shift
+	if [ "$tc_t" -le 0 ] 2>/dev/null; then "$@" > "$OUT" 2>/dev/null; return $?; fi
+	"$@" > "$OUT" 2>/dev/null &
+	tc_p=$!
+	( sleep "$tc_t"; kill -9 "$tc_p" 2>/dev/null ) > /dev/null 2>&1 &
+	tc_w=$!
+	wait "$tc_p"; tc_rc=$?
+	pkill -P "$tc_w" 2>/dev/null
+	kill "$tc_w" 2>/dev/null
+	wait "$tc_w" 2>/dev/null
+	return "$tc_rc"
+}
+cli() { tcall "$CLI_TIMEOUT" zerotier-cli "$@"; }
+
+# ---------------------------------------------------------------- state kept in RAM between checks
+state_reset() {
+	S_LAST_UP=0; S_FAIL_SINCE=0; S_REASON=''; S_KIND=''; S_STEPS=''; S_RESTARTS=0; S_NEXT_RESTART=0
+	S_REAPPLY_AT=0; S_PODKOP_AT=0; S_PODKOP_RESUME=0; S_OK_SINCE=0; S_SEED_PID=''; S_SEEDS=0
+	S_CACHE_UP=0; S_DEAD_N=0; S_DEAD_NEXT=0; S_REC_UP=0; S_REC_DIRTY=0; S_NOCFG_SINCE=0; S_HEALTH='';
+	S_REBOOT_AT=0; S_BUSY=''; S_DOOR_AT=0; S_LIVE_AT=0; S_NOTE=''; S_STARTED=''; S_UNCONF_DONE=0
+	S_PID=''; S_PID_SINCE=0; S_LIVE_N=0
+	S_ROOTS=''; S_ROOTS_AT=0; S_CONF_M=0; S_CONF_N=0; S_CONF_OK=0; S_SEED_M=0; S_CS_NEXT=0; S_HIST_UP=0; S_NORESPAWN=0
+	S_LADDER=0; S_NONET=0
+}
+state_load() {
+	state_reset
+	[ -f "$STATE" ] || return 0
+	while IFS='=' read -r sl_k sl_v; do
+		case "$sl_k" in S_*) ;; *) continue ;; esac
+		case "$sl_k" in *[!A-Z_]*) continue ;; esac
+		case "$sl_v" in *[!A-Za-z0-9_,.:\ -]*) continue ;; esac
+		eval "$sl_k=\$sl_v"
+	done < "$STATE"
+}
+state_save() {
+	mkdir -p "$RAM" 2>/dev/null || return 0
+	{
+		for ss_k in S_LAST_UP S_FAIL_SINCE S_REASON S_KIND S_STEPS S_RESTARTS S_NEXT_RESTART S_REAPPLY_AT S_PODKOP_AT \
+			S_PODKOP_RESUME S_OK_SINCE S_SEED_PID S_SEEDS S_CACHE_UP S_DEAD_N S_DEAD_NEXT S_REC_UP S_REC_DIRTY \
+			S_NOCFG_SINCE S_HEALTH S_REBOOT_AT S_BUSY S_DOOR_AT S_LIVE_AT S_NOTE S_STARTED S_UNCONF_DONE S_PID S_PID_SINCE S_LIVE_N \
+			S_ROOTS S_ROOTS_AT S_CONF_M S_CONF_N S_CONF_OK S_SEED_M S_CS_NEXT S_HIST_UP S_NORESPAWN S_LADDER S_NONET; do
+			eval "printf '%s=%s\n' $ss_k \"\$$ss_k\""
+		done
+	} > "$STATE.new" 2>/dev/null && mv "$STATE.new" "$STATE"
+}
+add_step() { case ",$S_STEPS," in *",$1,"*) ;; *) S_STEPS="${S_STEPS:+$S_STEPS,}$1" ;; esac; }
+
+# ---------------------------------------------------------------- flash records (small, on change)
+flash_write() {  # <file> <text>: only when the text differs from what is there
+	[ "$(cat "$1" 2>/dev/null)" = "$2" ] && return 0
+	mkdir -p "$FLASH" 2>/dev/null || return 1
+	printf '%s\n' "$2" > "$1.new" 2>/dev/null && mv "$1.new" "$1"
+}
+reboot_count() { num "$(sed -n 's/^count=//p' "$REBOOTS" 2>/dev/null | head -n 1)"; }
+# The last incident: always in RAM; on flash when it changed, at most once in ten minutes unless forced.
+record_incident() {  # <state> [force]
+	printf '%s\n' "started=$S_STARTED
+kind=$S_KIND
+reason=$S_REASON
+steps=$S_STEPS
+state=$1
+updated=$(stamp)
+lasted_s=$(( UP - S_FAIL_SINCE ))${S_NOTE:+
+note=$S_NOTE}" > "$RAM/last-incident" 2>/dev/null
+	S_REC_DIRTY=1
+	flush_incident "${2:-}"
+}
+flush_incident() {  # [force]
+	[ "$S_REC_DIRTY" = 1 ] && [ -f "$RAM/last-incident" ] || return 0
+	if [ "${1:-}" != force ] && [ "$S_REC_UP" -gt 0 ] && [ $(( UP - S_REC_UP )) -lt 600 ]; then return 0; fi
+	flash_write "$INCIDENT" "$(cat "$RAM/last-incident")" && { S_REC_UP=$UP; S_REC_DIRTY=0; }
+}
+
+# ---------------------------------------------------------------- what is configured
+zt_enabled() {
+	have zerotier-cli && have jsonfilter || return 1
+	[ -x "$INITD/zerotier" ] || return 1
+	[ "$(uci -q get zerotier.global.enabled 2>/dev/null)" = 1 ] || return 1
+	"$INITD/zerotier" enabled >/dev/null 2>&1 || return 1
+}
+network_ids() {
+	uci -q show zerotier 2>/dev/null | sed -n "s/^zerotier\.[^.]*\.id='\([0-9A-Fa-f]\{16\}\)'\$/\1/p" | tr 'A-F' 'a-f'
+}
+network_managed() {  # <id>: 0 when this network's addresses are switched off in the settings
+	nm_sec="$(uci -q show zerotier 2>/dev/null | sed -n "s/^zerotier\.\([^.]*\)\.id='$1'\$/\1/p" | head -n 1)"
+	[ -n "$nm_sec" ] || return 0
+	[ "$(uci -q get "zerotier.$nm_sec.allow_managed" 2>/dev/null)" != 0 ]
+}
+
+# ---------------------------------------------------------------- health
+# A network the controller refused (node not authorised, or no such network) is not guarded until it works again:
+# nothing on the router can change the controller's mind, and a reboot for it would be for nothing.
+refused_flag() { printf '%s/refused-%s' "$FLASH" "$1"; }
+
+# Sets H_REASON ('' = healthy), H_REFUSED (the controller said no, now or before), H_PID, H_NOCFG (ids waiting
+# for settings), H_OK_IDS (ids that are fine now), H_GUARDED (ids that are not refused).
+check_health() {
+	H_REASON=''; H_REFUSED=''; H_NOCFG=''; H_OK_IDS=''; H_STATE=''; H_GUARDED=''
+	for ch_id in $IDS; do [ -e "$(refused_flag "$ch_id")" ] || H_GUARDED="${H_GUARDED:+$H_GUARDED }$ch_id"; done
+	H_PID="$(pidof zerotier-one 2>/dev/null | awk '{print $1}')"
+	if [ -z "$H_PID" ]; then H_REASON='daemon-dead'; return 0; fi
+	if ! cli info; then H_REASON='no-answer'; return 0; fi
+	H_STATE="$(awk '/^200 info /{print $5; exit}' "$OUT")"
+	ch_nets=''
+	if cli listnetworks -j; then ch_nets="$(cat "$OUT")"; fi
+	if [ -z "$ch_nets" ]; then H_REASON='no-answer'; return 0; fi
+	# how many root servers (planets and moons) have a live path: "3of4"
+	H_ROOTS=''
+	if cli peers; then
+		H_ROOTS="$(awk '($3 == "PLANET" || $3 == "MOON") {n++; if ($5 == "DIRECT" && $4 >= 0) d++} END {if (n) print d + 0 "of" n}' "$OUT")"
+	fi
+	H_GUARDED=''
+	for ch_id in $IDS; do
+		ch_st="$(printf '%s\n' "$ch_nets" | jsonfilter -e "@[@.id=\"$ch_id\"].status" 2>/dev/null)"
+		if [ -e "$(refused_flag "$ch_id")" ]; then
+			if [ "$ch_st" = OK ]; then
+				rm -f "$(refused_flag "$ch_id")" && log "the controller lets this node in again: network …$(printf '%s' "$ch_id" | cut -c13-16) is guarded again"
+			else H_REFUSED="${H_REFUSED:+$H_REFUSED }$ch_id"; continue; fi
+		fi
+		H_GUARDED="${H_GUARDED:+$H_GUARDED }$ch_id"
+		case "$ch_st" in
+			OK) ;;
+			ACCESS_DENIED|NOT_FOUND)
+				H_REFUSED="${H_REFUSED:+$H_REFUSED }$ch_id"
+				mkdir -p "$FLASH" 2>/dev/null && : > "$(refused_flag "$ch_id")"
+				cache_drop "$ch_id"
+				log "the controller refuses this node in network …$(printf '%s' "$ch_id" | cut -c13-16) ($ch_st): it is not guarded until it works again"
+				H_GUARDED="$(printf '%s' " $H_GUARDED " | sed "s/ $ch_id / /" | sed 's/^ *//; s/ *$//')"
+				continue ;;
+			'') H_NOCFG="${H_NOCFG:+$H_NOCFG }$ch_id"; [ -n "$H_REASON" ] || H_REASON='network-absent'; continue ;;
+			REQUESTING_CONFIGURATION) H_NOCFG="${H_NOCFG:+$H_NOCFG }$ch_id"; [ -n "$H_REASON" ] || H_REASON='network-no-settings'; continue ;;
+			*) [ -n "$H_REASON" ] || H_REASON="network-$(printf '%s' "$ch_st" | tr 'A-Z_' 'a-z-' | tr -cd 'a-z-')"; continue ;;
+		esac
+		if network_managed "$ch_id"; then
+			ch_ips="$(printf '%s\n' "$ch_nets" | jsonfilter -e "@[@.id=\"$ch_id\"].assignedAddresses[*]" 2>/dev/null)"
+			if [ -z "$ch_ips" ]; then [ -n "$H_REASON" ] || H_REASON='no-address'; continue; fi
+			ch_dev="$(printf '%s\n' "$ch_nets" | jsonfilter -e "@[@.id=\"$ch_id\"].portDeviceName" 2>/dev/null)"
+			if [ -n "$ch_dev" ] && have ip; then
+				# IPv4 only: the kernel prints IPv6 addresses in another form than ZeroTier does
+				ch_on=''; ch_have="$(ip -4 addr show dev "$ch_dev" 2>/dev/null)"
+				for ch_ip in $ch_ips; do
+					case "$ch_ip" in *.*) ;; *) continue ;; esac
+					case "$ch_have" in *"inet ${ch_ip} "*) ch_on=1 ;; *) [ -n "$ch_on" ] || ch_on=0 ;; esac
+				done
+				if [ "$ch_on" = 0 ]; then [ -n "$H_REASON" ] || H_REASON='address-not-on-interface'; continue; fi
+			fi
+		fi
+		H_OK_IDS="${H_OK_IDS:+$H_OK_IDS }$ch_id"
+	done
+	# Is the controller still refreshing the settings? The daemon rewrites <network>.conf on every refresh (about once
+	# a minute). A node whose settings are not refreshed keeps its address and says OK, but its pass goes stale and
+	# after half an hour the other members stop accepting it: "internet works, ZeroTier does not".
+	# Judged only once this daemon has been seen rewriting the file, so a build that does not is never misjudged.
+	H_CTRL=''
+	for ch_id in $H_OK_IDS; do
+		ch_m="$(num "$(date -r "$(ram_conf "$ch_id")" +%s 2>/dev/null)")"
+		[ "$ch_m" -gt 0 ] || break
+		if [ "$ch_m" != "$S_CONF_M" ]; then
+			[ "$S_CONF_M" = 0 ] || [ "$ch_m" = "$S_SEED_M" ] || S_CONF_N=$(( S_CONF_N + 1 ))
+			S_CONF_M=$ch_m
+		fi
+		[ "$S_CONF_N" -lt 2 ] || S_CONF_OK=1
+		if [ "$S_CONF_OK" = 1 ]; then
+			if [ "$ch_m" = "$S_SEED_M" ]; then H_CTRL=silent   # still the settings the guard put back: nothing fresh since
+			elif [ $(( $(now_epoch) - ch_m )) -ge "$CONTROLLER_SILENT" ]; then H_CTRL=silent; fi
+		fi
+		break
+	done
+	[ -z "$H_REASON" ] || return 0
+	case "$H_STATE" in
+		ONLINE|TUNNELED) ;;
+		*) H_REASON='offline'; return 0 ;;
+	esac
+	# at least one root server with a live path
+	case "$H_ROOTS" in 0of*) [ "$H_STATE" != ONLINE ] || { H_REASON='no-root'; return 0; } ;; esac
+	[ "$H_CTRL" != silent ] || H_REASON='controller-silent'
+	return 0
+}
+
+# Is there a way out to the internet at all? Prints why not, or nothing. Asked only while ZeroTier is unwell: with
+# no default route, or with no root server and no well-known public address answering, nothing on the router can
+# help ZeroTier, and the repair steps would only disturb.
+internet_down() {
+	ip -4 route show default 2>/dev/null | grep -q . || { echo 'no default route'; return 0; }
+	case "${H_ROOTS:-}" in 0of*|'') ;; *) return 0 ;; esac   # a root server answers: there is a way out
+	for in_t in 1.1.1.1 8.8.8.8 77.88.8.8; do ping -c 1 -W 2 "$in_t" >/dev/null 2>&1 && return 0; done
+	echo 'no root server and no public address answers'
+}
+
+# Live firewall state that the app owns: the bypass chain and the rule that lets SSH/LuCI in from ZeroTier.
+# Prints what is missing. Reads only.
+live_missing() {
+	have nft || return 0
+	"$INITD/firewall" enabled >/dev/null 2>&1 || return 0
+	lm=''
+	if [ -f "$BYPASS_FILE" ] || [ -f "$BYPASS_TEMPLATE" ]; then
+		[ -f "$BYPASS_FILE" ] || lm='bypass-file'
+		nft list chain inet fw4 podkop_zerotier_bypass >/dev/null 2>&1 || lm="${lm:+$lm }bypass-chain"
+	fi
+	if [ "$(uci -q get "firewall.$FW_RULE.target" 2>/dev/null)" = ACCEPT ] &&
+		[ "$(uci -q get "firewall.$FW_RULE.enabled" 2>/dev/null)" != 0 ]; then
+		nft list chain inet fw4 "input_$FW_ZONE" 2>/dev/null | grep -q "$FW_RULE_NAME" || lm="${lm:+$lm }ssh-rule"
+	fi
+	printf '%s' "$lm"
+}
+
+# ---------------------------------------------------------------- busy: no disruptive step while these run
+busy_reason() {
+	if have pgrep; then
+		pgrep -f 'sysupgrade|/lib/upgrade/|/sbin/upgraded' >/dev/null 2>&1 && { echo 'firmware upgrade'; return; }
+		{ pgrep -x apk >/dev/null 2>&1 || pgrep -x opkg >/dev/null 2>&1; } && { echo 'package install'; return; }
+		pgrep -f 'podkop-pe|podkop-install|podkop-uninstall|router-install\.sh|zerotier-support/helper (install|configure|leave|restart|disable)' >/dev/null 2>&1 &&
+			{ echo 'installer'; return; }
+	fi
+	for br_f in "$R"/tmp/sysupgrade.* "$R/tmp/firmware.bin"; do
+		[ -e "$br_f" ] || continue
+		br_age=$(( $(now_epoch) - $(num "$(date -r "$br_f" +%s 2>/dev/null)") ))
+		[ "$br_age" -lt 3600 ] && { echo 'firmware image in memory'; return; }
+	done
+	# the personal images put Podkop back by a one-shot service on the first boot
+	if [ -s "$R/usr/share/fleet-firstboot/podkop-pe.run" ] && [ ! -e "$R/etc/fleet-podkop-firstboot.done" ] &&
+		[ "$UP" -lt 1500 ]; then echo 'first-boot installer'; return; fi
+	return 0
+}
+
+# ---------------------------------------------------------------- kept network settings
+cache_path() { printf '%s/network-%s.cache' "$FLASH" "$1"; }
+ram_conf() { printf '%s/networks.d/%s.conf' "$ZT_HOME" "$1"; }
+# the part of a network configuration that does not change by itself: everything but the timestamp and the
+# credentials the controller re-issues on every refresh
+stable_sum() { grep -av -E '^(ts|C|COO|CAP|TAG)=' "$1" 2>/dev/null | sha256sum | cut -c1-64; }
+
+# header: zrs-cache-v1 <sha256 of the payload> <stable sum> <network id> <saved epoch>; then the payload, as is
+cache_valid() {  # <id> [payload file to write]; 0 when the kept copy is whole, for this network and not too old
+	cv_f="$(cache_path "$1")"
+	[ -s "$cv_f" ] || return 1
+	cv_h="$(head -n 1 "$cv_f" 2>/dev/null)"
+	set -- "$1" "${2:-}" $cv_h
+	[ "${3:-}" = zrs-cache-v1 ] && [ "${6:-}" = "$1" ] || return 2
+	cv_tmp="$RAM/.payload.$$"
+	tail -n +2 "$cv_f" > "$cv_tmp" 2>/dev/null || { rm -f "$cv_tmp"; return 2; }
+	if [ "$(sha256sum < "$cv_tmp" | cut -c1-64)" != "${4:-}" ] || [ "$(fsize "$cv_tmp")" -lt 64 ] ||
+		! grep -aq "^nwid=0*$1\$" "$cv_tmp"; then rm -f "$cv_tmp"; return 2; fi
+	cv_age=$(( $(now_epoch) - $(num "${7:-}") ))
+	if [ "$cv_age" -gt "$CACHE_MAX_AGE" ]; then rm -f "$cv_tmp"; return 3; fi
+	if [ -n "$2" ]; then mv "$cv_tmp" "$2"; else rm -f "$cv_tmp"; fi
+	return 0
+}
+cache_save() {  # <id> [force]: copy the daemon's current settings of an OK network to flash, when due
+	[ "$CACHE" = 1 ] || return 0
+	cs_src="$(ram_conf "$1")"
+	cs_n="$(fsize "$cs_src")"
+	[ "$cs_n" -ge 64 ] && [ "$cs_n" -le 65536 ] || return 0
+	grep -aq "^nwid=0*$1\$" "$cs_src" || return 0
+	cs_f="$(cache_path "$1")"
+	cs_tmp="$RAM/.cache.$$"
+	cp "$cs_src" "$cs_tmp" 2>/dev/null || return 0
+	cs_sum="$(sha256sum < "$cs_tmp" | cut -c1-64)"
+	cs_stable=''
+	cs_old="$(head -n 1 "$cs_f" 2>/dev/null)"
+	set -- "$1" "${2:-}" $cs_old
+	cs_why=''
+	if [ "${3:-}" != zrs-cache-v1 ] || [ "${6:-}" != "$1" ]; then cs_why='first copy'
+	elif [ "${4:-}" = "$cs_sum" ]; then rm -f "$cs_tmp"; return 0
+	elif [ "$2" = force ]; then cs_why='before a restart'
+	else
+		# how long since the last write: by uptime within this boot, by the saved time after a boot
+		if [ "$S_CACHE_UP" -gt 0 ]; then cs_since=$(( UP - S_CACHE_UP ))
+		else cs_since=$(( $(now_epoch) - $(num "${7:-}") )); [ "$cs_since" -ge 0 ] || cs_since="$CACHE_MIN_GAP"; fi
+		if [ "$cs_since" -lt "$CACHE_MIN_GAP" ]; then rm -f "$cs_tmp"; return 0; fi
+		cs_stable="$(stable_sum "$cs_tmp")"
+		if [ "${5:-}" != "$cs_stable" ]; then cs_why='settings changed'
+		elif [ "$cs_since" -ge "$CACHE_REFRESH" ]; then cs_why='refresh'
+		else rm -f "$cs_tmp"; return 0; fi
+	fi
+	[ -n "$cs_stable" ] || cs_stable="$(stable_sum "$cs_tmp")"
+	mkdir -p "$FLASH" 2>/dev/null || { rm -f "$cs_tmp"; return 0; }
+	{ printf 'zrs-cache-v1 %s %s %s %s\n' "$cs_sum" "$cs_stable" "$1" "$(now_epoch)"; cat "$cs_tmp"; } > "$cs_f.new" 2>/dev/null &&
+		chmod 0600 "$cs_f.new" && mv "$cs_f.new" "$cs_f" && S_CACHE_UP=$UP
+	rm -f "$cs_tmp" "$cs_f.new"
+	[ "$cs_why" = refresh ] || log "kept network settings written to flash ($cs_why)"
+	return 0
+}
+cache_drop() {  # <id>: the controller refused this node; its old settings must not come back
+	[ -e "$(cache_path "$1")" ] || return 0
+	rm -f "$(cache_path "$1")" && log "kept network settings removed: the controller refuses this node in network …$(printf '%s' "$1" | cut -c13-16)"
+}
+# Put the kept settings where the daemon reads them at start and let procd start the daemon again
+# (procd runs only the program then; the init script, which empties the directory, is not involved).
+# Does procd start the daemon again by itself after it exits? (The stock start-up script asks for that; one
+# router of the fleet has a script that does not.)
+procd_respawns() {
+	ubus call service list '{"name":"zerotier"}' 2>/dev/null | jsonfilter -e '@.zerotier.instances.*.respawn.retry' 2>/dev/null | grep -q .
+}
+seed_possible() {  # a network that waits for settings has a whole kept copy, and procd will start the daemon again
+	for sp_id in $H_NOCFG; do cache_valid "$sp_id" && { procd_respawns; return $?; }; done
+	return 1
+}
+can_seed() {  # every network that is fine now has a whole kept copy, and procd will start the daemon again
+	[ "$CACHE" = 1 ] && [ -n "$H_OK_IDS" ] || return 1
+	for cn_id in $H_OK_IDS; do cache_valid "$cn_id" || return 1; done
+	procd_respawns
+}
+seed() {
+	if ! procd_respawns; then
+		[ "$S_NORESPAWN" = 1 ] || log "kept network settings cannot be put back here: this router's ZeroTier service is not started again by the system (no respawn in its start-up script)"
+		S_NORESPAWN=1
+		return 1
+	fi
+	sd_ok=''
+	for sd_id in $H_NOCFG; do
+		sd_dst="$(ram_conf "$sd_id")"
+		[ -d "$ZT_HOME/networks.d" ] || continue
+		cache_valid "$sd_id" "$sd_dst.zrs" || { sd_rc=$?; [ "$sd_rc" = 1 ] || log "kept network settings not used: $( [ "$sd_rc" = 3 ] && echo 'too old' || echo 'damaged' )"; rm -f "$sd_dst.zrs"; continue; }
+		chmod 0600 "$sd_dst.zrs" 2>/dev/null
+		mv "$sd_dst.zrs" "$sd_dst" && sd_ok=1 && S_SEED_M="$(num "$(date -r "$sd_dst" +%s 2>/dev/null)")"
+	done
+	[ -n "$sd_ok" ] || return 1
+	S_SEEDS=$(( S_SEEDS + 1 )); add_step 'kept-settings'
+	log "controller does not answer: kept network settings put back, daemon restarting (pid $H_PID)"
+	kill "$H_PID" 2>/dev/null
+	sd_i=0; sd_new=''
+	while [ "$sd_i" -lt 30 ]; do
+		sleep 1; sd_i=$(( sd_i + 1 ))
+		sd_new="$(pidof zerotier-one 2>/dev/null | awk '{print $1}')"
+		[ -n "$sd_new" ] && [ "$sd_new" != "$H_PID" ] && break
+		sd_new=''
+	done
+	if [ -z "$sd_new" ]; then log "the daemon did not come back by itself after the kept settings were put back"; S_SEED_PID=''; return 0; fi
+	S_SEED_PID="$sd_new"; S_PID="$sd_new"; S_PID_SINCE=$UP
+	return 0
+}
+
+# ---------------------------------------------------------------- repair steps
+# after the guard itself has (re)started the daemon: the time it gets to come up runs from now
+mark_started() { S_PID="$(pidof zerotier-one 2>/dev/null | awk '{print $1}')"; S_PID_SINCE=$UP; }
+
+do_restart() {  # <why>
+	for dr_id in $H_OK_IDS; do cache_save "$dr_id" force; done
+	S_RESTARTS=$(( S_RESTARTS + 1 )); add_step 'restart'
+	dr_gap="$RESTART_GAP"; dr_i=1
+	while [ "$dr_i" -lt "$S_RESTARTS" ] && [ "$dr_gap" -lt "$RESTART_GAP_MAX" ]; do dr_gap=$(( dr_gap * 2 )); dr_i=$(( dr_i + 1 )); done
+	[ "$dr_gap" -le "$RESTART_GAP_MAX" ] || dr_gap="$RESTART_GAP_MAX"
+	S_NEXT_RESTART=$(( UP + dr_gap ))
+	S_SEED_PID=''; S_NOCFG_SINCE=0
+	log "step: restart ZeroTier (#$S_RESTARTS, $1); next restart not before ${dr_gap}s"
+	"$INITD/zerotier" restart >/dev/null 2>&1 || log "the ZeroTier init script returned an error"
+	mark_started
+}
+do_dead_start() {
+	[ "$UP" -ge "$S_DEAD_NEXT" ] || return 0
+	# procd restarts a crashed daemon by itself after five seconds, five times an hour: give it the first go
+	if [ "$S_DEAD_N" = 0 ] && [ -z "${ZRS_GUARD_NO_WAIT:-}" ]; then
+		sleep 10
+		[ -n "$(pidof zerotier-one 2>/dev/null)" ] && { log "daemon was down, procd brought it back"; return 0; }
+	fi
+	S_DEAD_N=$(( S_DEAD_N + 1 )); add_step 'start'
+	dd_gap=60; dd_i=1
+	while [ "$dd_i" -lt "$S_DEAD_N" ] && [ "$dd_gap" -lt 900 ]; do dd_gap=$(( dd_gap * 2 )); dd_i=$(( dd_i + 1 )); done
+	[ "$dd_gap" -le 900 ] || dd_gap=900
+	S_DEAD_NEXT=$(( UP + dd_gap ))
+	S_SEED_PID=''; S_NOCFG_SINCE=0
+	log "step: the ZeroTier daemon is not running, starting it (#$S_DEAD_N); next try not before ${dd_gap}s"
+	"$INITD/zerotier" restart >/dev/null 2>&1 || log "the ZeroTier init script returned an error"
+	mark_started
+}
+runtime_ports() {
+	have jsonfilter || return 0
+	cli info -j || return 0
+	for rp_e in '@.config.settings.primaryPort' '@.config.settings.secondaryPort' '@.config.settings.tertiaryPort'; do
+		jsonfilter -e "$rp_e" < "$OUT" 2>/dev/null
+	done
+}
+# Re-apply what the app owns, live only: the bypass file from its template when the file is gone, a firewall
+# reload so that the file and the saved rules are in force, the ports the daemon really uses in the bypass set.
+do_reapply() {  # <why>
+	S_REAPPLY_AT=$UP; add_step 'reapply'
+	log "step: re-apply the bypass and the firewall state ($1)"
+	if [ ! -f "$BYPASS_FILE" ] && [ -s "$BYPASS_TEMPLATE" ]; then
+		mkdir -p "$(dirname "$BYPASS_FILE")" && cp "$BYPASS_TEMPLATE" "$BYPASS_FILE.new" && chmod 0644 "$BYPASS_FILE.new" &&
+			mv "$BYPASS_FILE.new" "$BYPASS_FILE" && log "the bypass file was missing: restored from the app's template"
+	fi
+	if [ -x "$INITD/firewall" ] && "$INITD/firewall" enabled >/dev/null 2>&1; then
+		"$INITD/firewall" reload >/dev/null 2>&1 || log "firewall reload returned an error"
+	fi
+	if have nft && nft list set inet fw4 podkop_zerotier_udp_ports >/dev/null 2>&1; then
+		ra_ports="$ZT_PORTS"
+		for ra_p in $(runtime_ports); do
+			case "$ra_p" in ''|*[!0-9]*) continue ;; esac
+			[ "$ra_p" -ge 1 ] && [ "$ra_p" -le 65535 ] || continue
+			case " $ra_ports " in *" $ra_p "*) ;; *) ra_ports="$ra_ports $ra_p" ;; esac
+		done
+		ra_el="$(printf '%s' "$ra_ports" | sed 's/  */, /g')"
+		printf 'flush set inet fw4 podkop_zerotier_udp_ports\nadd element inet fw4 podkop_zerotier_udp_ports { %s }\n' "$ra_el" > "$RAM/.nft.$$"
+		{ nft -c -f "$RAM/.nft.$$" && nft -f "$RAM/.nft.$$"; } >/dev/null 2>&1 || log "the bypass port set could not be synchronised"
+		rm -f "$RAM/.nft.$$"
+	fi
+}
+door_check() {  # the SSH server itself: started again when it is enabled and not running
+	[ -x "$INITD/dropbear" ] || return 0
+	[ -n "$(pidof dropbear 2>/dev/null)" ] && return 0
+	"$INITD/dropbear" enabled >/dev/null 2>&1 || return 0
+	[ "$S_DOOR_AT" -gt 0 ] && [ $(( UP - S_DOOR_AT )) -lt 300 ] && return 0
+	S_DOOR_AT=$UP
+	log "the SSH server (dropbear) is not running: starting it"
+	"$INITD/dropbear" start >/dev/null 2>&1 || true
+}
+
+podkop_running() {
+	nft list table inet PodkopTable >/dev/null 2>&1 || [ -n "$(pidof sing-box 2>/dev/null)" ]
+}
+podkop_pause_allowed() {
+	[ "$PODKOP" = 1 ] && [ "$S_PODKOP_RESUME" = 0 ] || return 1
+	[ "$S_PODKOP_AT" = 0 ] || [ $(( UP - S_PODKOP_AT )) -ge "$PODKOP_GAP" ] || return 1
+	[ -x "$INITD/podkop" ] && "$INITD/podkop" enabled >/dev/null 2>&1 || return 1
+	[ -e "$R/etc/sing-box/failsafe.last" ] && return 1          # Podkop's own fail-open already stopped it
+	[ -d "$R/tmp/podkop-subscription-action.lock.d" ] && return 1  # Podkop is in the middle of its own work
+	podkop_running
+}
+do_podkop_pause() {
+	S_PODKOP_AT=$UP; S_PODKOP_RESUME=$(( UP + PODKOP_PAUSE )); add_step 'podkop-pause'
+	log "step: pause Podkop for ${PODKOP_PAUSE}s (its own init script: stop, then start)"
+	state_save
+	"$INITD/podkop" stop >/dev/null 2>&1 || log "Podkop's init script returned an error on stop"
+	# the daemon gets a fresh start while Podkop is out of the way
+	[ "$S_NEXT_RESTART" -le $(( UP + 120 )) ] || S_NEXT_RESTART=$(( UP + 120 ))
+}
+podkop_resume() {
+	[ "$S_PODKOP_RESUME" -gt 0 ] && [ "$UP" -ge "$S_PODKOP_RESUME" ] || return 0
+	S_PODKOP_RESUME=0; CY_RESUMED=1
+	log "Podkop pause is over: starting Podkop again"
+	state_save
+	if [ -x "$INITD/podkop" ]; then
+		"$INITD/podkop" start >/dev/null 2>&1 || log "Podkop's init script returned an error on start (its own fail-open and retry take over)"
+	fi
+}
+
+reboot_allowed() {
+	[ "$REBOOT" = 1 ] || return 1
+	[ "$UP" -ge "$REBOOT_MIN_UPTIME" ] || return 1
+	[ "$S_REBOOT_AT" = 0 ] || [ $(( UP - S_REBOOT_AT )) -ge 600 ] || return 1
+	rb_n="$(reboot_count)"
+	[ "$rb_n" -gt 0 ] || return 0
+	# after a reboot of ours the next one needs this much uptime: it holds whatever the clock says
+	rb_gap="$REBOOT_GAP"; rb_i=1
+	while [ "$rb_i" -lt "$rb_n" ] && [ "$rb_gap" -lt 86400 ]; do rb_gap=$(( rb_gap * 2 )); rb_i=$(( rb_i + 1 )); done
+	[ "$rb_gap" -le 86400 ] || rb_gap=86400
+	[ "$UP" -ge "$rb_gap" ]
+}
+do_reboot() {
+	for rb_id in $H_OK_IDS; do cache_save "$rb_id" force; done
+	S_REBOOT_AT=$UP; add_step 'reboot'
+	rb_n=$(( $(reboot_count) + 1 ))
+	flash_write "$REBOOTS" "count=$rb_n
+last=$(stamp)
+reason=$S_REASON"
+	if [ "$S_KIND" = unconfirmed ] && [ -e "$PENDING" ]; then flash_write "$PENDING" "used $(stamp) reboot"; fi
+	record_incident rebooted force
+	history_add rebooted
+	log "step: reboot (#$rb_n in a row; nothing else helped for $(( UP - S_FAIL_SINCE ))s)"
+	state_save
+	sync 2>/dev/null
+	reboot
+}
+
+# ---------------------------------------------------------------- incidents
+incident_open() {  # <kind> <reason>
+	S_FAIL_SINCE=$UP; S_LADDER=$UP; S_KIND="$1"; S_REASON="$2"; S_STEPS=''; S_RESTARTS=0; S_NOTE=''; S_STARTED="$(stamp)"
+	S_NEXT_RESTART=$(( UP + FAIL_RESTART )); S_REAPPLY_AT=0; S_DEAD_N=0; S_DEAD_NEXT=0; S_OK_SINCE=0
+	log "problem: $2"
+}
+# One line per incident that lasted three minutes or needed a step, the last forty kept on flash: what the router
+# itself saw, to be read when someone asks afterwards why it could not be reached. A line waits in RAM until the
+# flash may be written again (HISTORY_GAP); before a reboot of the guard's own and at shutdown it is written at once.
+history_add() {  # <state>
+	ha_len=$(( UP - S_FAIL_SINCE ))
+	ha_steps="$(printf '%s' "$S_STEPS" | sed 's/held//; s/^,//; s/,$//')"
+	[ "$ha_len" -ge 180 ] || [ -n "$ha_steps" ] || return 0
+	printf '%s lasted=%ss reason=%s steps=%s state=%s%s\n' "$S_STARTED" "$ha_len" "$S_REASON" "${S_STEPS:-none}" "$1" "${S_NOTE:+ note=$S_NOTE}" \
+		>> "$RAM/incidents.pending" 2>/dev/null
+	if [ "$1" = rebooted ]; then history_flush force; else history_flush; fi
+}
+history_flush() {  # [force]
+	[ -s "$RAM/incidents.pending" ] || return 0
+	if [ "${1:-}" != force ] && [ "$S_HIST_UP" -gt 0 ] && [ $(( UP - S_HIST_UP )) -lt "$HISTORY_GAP" ]; then return 0; fi
+	mkdir -p "$FLASH" 2>/dev/null || return 0
+	{ cat "$FLASH/incidents" 2>/dev/null; cat "$RAM/incidents.pending"; } | tail -n 40 > "$FLASH/incidents.new" 2>/dev/null &&
+		mv "$FLASH/incidents.new" "$FLASH/incidents" && rm -f "$RAM/incidents.pending" && S_HIST_UP=$UP
+}
+incident_close() {  # <state> <text>
+	[ "$S_FAIL_SINCE" -gt 0 ] || return 0
+	if [ "$S_PODKOP_RESUME" -gt 0 ] && [ "$1" = recovered ]; then S_NOTE='came back while Podkop was paused'; fi
+	log "$2 after $(( UP - S_FAIL_SINCE ))s${S_STEPS:+ (steps: $S_STEPS)}${S_NOTE:+; $S_NOTE}"
+	[ -z "$S_STEPS" ] || record_incident "$1"
+	history_add "$1"
+	S_FAIL_SINCE=0; S_KIND=''; S_REASON=''; S_RESTARTS=0; S_DEAD_N=0; S_DEAD_NEXT=0; S_NONET=0
+}
+
+cycle() {
+	UP="$(num "$(now_up)")"
+	if [ "$UP" -lt "$S_LAST_UP" ]; then state_reset; fi   # the router has rebooted since the saved state
+	S_LAST_UP=$UP
+	CY_RESUMED=0
+	podkop_resume
+
+	if ! zt_enabled; then
+		[ "$S_HEALTH" = idle ] || log "ZeroTier is switched off or not installed: nothing to guard"
+		incident_close idle 'guarding stopped'
+		S_HEALTH=idle; return 0
+	fi
+	IDS="$(network_ids | tr '\n' ' ')"
+	if [ -z "$(printf '%s' "$IDS" | tr -d ' ')" ]; then
+		[ "$S_HEALTH" = idle ] || log "no ZeroTier network is configured: nothing to guard"
+		incident_close idle 'guarding stopped'
+		S_HEALTH=idle; return 0
+	fi
+
+	S_BUSY=''
+	check_health
+	# a daemon that was started a moment ago (by procd, by the guard, by anyone) is not judged yet
+	if [ "$H_PID" != "$S_PID" ]; then S_PID="$H_PID"; S_PID_SINCE=$UP; fi
+	if [ -n "${H_ROOTS:-}" ] && [ "$H_ROOTS" != "$S_ROOTS" ]; then
+		if [ -n "$S_ROOTS" ] && { [ "$S_ROOTS_AT" = 0 ] || [ $(( UP - S_ROOTS_AT )) -ge 600 ]; }; then
+			log "ZeroTier root servers reachable: $H_ROOTS (was $S_ROOTS)"; S_ROOTS_AT=$UP
+		fi
+		S_ROOTS="$H_ROOTS"
+	fi
+	door_check
+	for cy_id in $H_OK_IDS; do cache_save "$cy_id"; done
+	if [ -n "$H_NOCFG" ]; then [ "$S_NOCFG_SINCE" -gt 0 ] || S_NOCFG_SINCE=$UP; else S_NOCFG_SINCE=0; fi
+	case "$H_REASON" in
+		offline|no-root|controller-silent|network-*|no-address|address-not-on-interface)
+			cy_net="$(internet_down)"
+			if [ -n "$cy_net" ]; then
+				[ "$S_REASON" = no-internet ] || log "no internet ($cy_net): the repair steps wait until it is back"
+				H_REASON=no-internet
+			fi ;;
+	esac
+
+	# the app's live firewall state: cheap to put back, so it does not wait for the ladder
+	# (again after 5 minutes, then 10, 20, 40 and every hour for as long as it does not help)
+	cy_live="$(live_missing)"
+	if [ -z "$cy_live" ]; then S_LIVE_N=0
+	elif [ -z "$(busy_reason)" ]; then
+		cy_gap=300; cy_i=1
+		while [ "$cy_i" -lt "$S_LIVE_N" ] && [ "$cy_gap" -lt 3600 ]; do cy_gap=$(( cy_gap * 2 )); cy_i=$(( cy_i + 1 )); done
+		[ "$cy_gap" -le 3600 ] || cy_gap=3600
+		if [ "$S_LIVE_N" = 0 ] || [ $(( UP - S_LIVE_AT )) -ge "$cy_gap" ]; then
+			S_LIVE_AT=$UP; S_LIVE_N=$(( S_LIVE_N + 1 ))
+			do_reapply "missing: $cy_live"
+		fi
+	fi
+
+	if [ -z "$H_GUARDED" ]; then
+		# every network is refused by the controller: only keep the daemon running, so that it learns when it is let in
+		if [ "$H_REASON" = daemon-dead ]; then do_dead_start; fi
+		incident_close refused 'guarding stopped'
+		S_HEALTH=refused; flush_incident; history_flush; return 0
+	fi
+
+	cy_pending=0
+	if [ -e "$PENDING" ] && [ "$(head -c 7 "$PENDING" 2>/dev/null)" = pending ]; then cy_pending=1; fi
+
+	if [ -z "$H_REASON" ]; then
+		if [ "$S_KIND" = fault ]; then incident_close recovered 'ZeroTier is back'; fi
+		if [ "$S_KIND" = unconfirmed ] && [ "$cy_pending" = 0 ]; then incident_close confirmed 'the upgrade was confirmed'; fi
+		if [ "$cy_pending" = 1 ] && [ "$S_KIND" != unconfirmed ] && [ "$UP" -ge "$CONFIRM" ] && [ "$S_UNCONF_DONE" = 0 ]; then
+			incident_open unconfirmed 'upgrade-not-confirmed'
+			log "the PC did not confirm the firmware upgrade within ${CONFIRM}s of uptime: walking the repair steps once"
+		fi
+		if [ "$S_KIND" != unconfirmed ]; then
+			[ "$S_OK_SINCE" -gt 0 ] || S_OK_SINCE=$UP
+			if [ $(( UP - S_OK_SINCE )) -ge 3600 ] && [ "$(reboot_count)" -gt 0 ]; then
+				flash_write "$REBOOTS" "count=0
+last=$(stamp)
+reason=healthy for an hour" && log "an hour without problems: the reboot counter is cleared"
+			fi
+			flush_incident
+			history_flush
+			S_HEALTH=ok; return 0
+		fi
+	else
+		S_OK_SINCE=0
+		if [ "$S_KIND" = unconfirmed ]; then S_KIND=fault; S_REASON="$H_REASON"; log "problem: $H_REASON"; fi
+		[ "$S_KIND" = fault ] || incident_open fault "$H_REASON"
+		case "$H_REASON" in
+			no-internet) S_NONET=1 ;;
+			daemon-dead|no-answer) ;;
+			*)	if [ "$S_NONET" = 1 ]; then
+					# the internet is back: ZeroTier gets the usual time to find its way by itself, then the steps
+					# start from the first one
+					S_NONET=0; S_LADDER=$UP; S_RESTARTS=0; S_REAPPLY_AT=0; S_NEXT_RESTART=$(( UP + FAIL_RESTART ))
+				fi ;;
+		esac
+		[ "$S_REASON" = "$H_REASON" ] || { log "problem is now: $H_REASON"; S_REASON="$H_REASON"; }
+	fi
+	S_HEALTH="${H_REASON:-unconfirmed}"
+	cy_from=$S_LADDER; [ "$cy_from" -gt 0 ] || cy_from=$S_FAIL_SINCE
+	cy_for=$(( UP - cy_from ))   # how long the steps have been running (from the start, or since the internet came back)
+
+	if [ "$S_KIND" = unconfirmed ] && { [ "$cy_for" -ge 7200 ] || { [ "$REBOOT" != 1 ] && [ "$cy_for" -ge "$FAIL_REBOOT" ] && [ "$S_PODKOP_RESUME" = 0 ]; }; }; then
+		flash_write "$PENDING" "used $(stamp) no-reboot"
+		S_UNCONF_DONE=1
+		incident_close gave-up 'the upgrade was never confirmed; the steps were walked once'
+		S_HEALTH=ok; return 0
+	fi
+
+	S_BUSY="$(busy_reason | tr -cd 'a-z -')"
+	if [ "$H_REASON" = daemon-dead ]; then
+		# a daemon that will not stay up: started again with back-off for as long as it takes, and the one
+		# reboot when that has not helped for long enough
+		if [ -z "$S_BUSY" ] && [ "$S_DEAD_N" -gt 0 ] && [ "$cy_for" -ge "$FAIL_REBOOT" ] && reboot_allowed; then do_reboot; return 0; fi
+		do_dead_start; record_incident open; return 0
+	fi
+
+	# the controller does not answer and settings are kept on flash: put them back before anything heavier
+	if [ -n "$H_NOCFG" ] && [ "$CACHE" = 1 ] && [ "$S_NOCFG_SINCE" -gt 0 ] && [ $(( UP - S_NOCFG_SINCE )) -ge "$SEED_AFTER" ] &&
+		[ "$H_PID" != "$S_SEED_PID" ] && [ "$S_SEEDS" -lt "$SEED_MAX" ]; then
+		if seed; then record_incident open; return 0; fi
+		S_SEED_PID="$H_PID"   # nothing usable is kept: do not look again until the daemon is a new one
+	fi
+
+	if [ -n "$S_BUSY" ]; then
+		case ",$S_STEPS," in *",held,"*) ;; *) log "repair steps are held back: $S_BUSY is running"; add_step held ;; esac
+		return 0
+	fi
+
+	# One step per check, always in the same order, however late the check comes: the lighter steps first, the
+	# reboot only after a restart and the live firewall state have been tried.
+	[ "$CY_RESUMED" = 0 ] || return 0   # Podkop was just started again: that was this check's step
+	[ $(( UP - S_PID_SINCE )) -ge "$GRACE" ] || return 0   # the daemon has only just been started: let it come up
+	[ "$UP" -ge "$BOOT_GRACE" ] || return 0                # the router has only just booted
+	[ "$S_REASON" != no-internet ] || return 0             # nothing on the router can bring the internet back
+	# A network that waits for its settings gets the kept ones back before anything heavier is tried: while that is
+	# still to come (the wait is not over yet), no step is taken. A restart now would only start the wait anew.
+	if [ -n "$H_NOCFG" ] && [ "$CACHE" = 1 ] && [ "$H_PID" != "$S_SEED_PID" ] && [ "$S_SEEDS" -lt "$SEED_MAX" ] &&
+		[ "$S_NOCFG_SINCE" -gt 0 ] && [ $(( UP - S_NOCFG_SINCE )) -lt "$SEED_AFTER" ] && seed_possible; then
+		return 0
+	fi
+	if [ "$S_REASON" = controller-silent ]; then
+		# The door is open as far as the router can tell; only its pass is going stale. One fresh start of the daemon,
+		# and only where the kept settings can be put back afterwards. Never a Podkop pause or a reboot for this.
+		if [ "$CONTROLLER_RESTART" = 1 ] && [ "$UP" -ge "$S_CS_NEXT" ] && [ "$UP" -ge "$S_NEXT_RESTART" ] && can_seed; then
+			S_CS_NEXT=$(( UP + CONTROLLER_RETRY ))
+			do_restart 'controller-silent'; record_incident open
+		fi
+		return 0
+	fi
+	if [ "$S_RESTARTS" = 0 ]; then
+		[ "$UP" -ge "$S_NEXT_RESTART" ] && { do_restart "$S_REASON"; record_incident open; }
+		return 0
+	fi
+	if [ "$S_REAPPLY_AT" = 0 ]; then
+		[ "$cy_for" -ge "$FAIL_REAPPLY" ] && { do_reapply 'ladder'; record_incident open; }
+		return 0
+	fi
+	if [ "$cy_for" -ge "$FAIL_PODKOP" ] && podkop_pause_allowed; then do_podkop_pause; record_incident open; return 0; fi
+	if [ "$cy_for" -ge "$FAIL_REBOOT" ] && [ "$S_PODKOP_RESUME" = 0 ] && reboot_allowed; then do_reboot; return 0; fi
+	if [ "$UP" -ge "$S_NEXT_RESTART" ]; then do_restart "$S_REASON"; record_incident open; return 0; fi
+	if [ $(( UP - S_REAPPLY_AT )) -ge 3600 ]; then do_reapply 'ladder, hourly'; return 0; fi
+	return 0
+}
+
+# ---------------------------------------------------------------- commands
+take_lock() {
+	mkdir -p "$RAM" 2>/dev/null
+	tl_p="$(cat "$LOCK" 2>/dev/null)"
+	if [ -n "$tl_p" ] && [ "$tl_p" != "$$" ] && kill -0 "$tl_p" 2>/dev/null &&
+		grep -q 'zerotier-support/guard' "/proc/$tl_p/cmdline" 2>/dev/null; then return 1; fi
+	echo "$$" > "$LOCK"
+}
+
+cmd_daemon() {
+	take_lock || { echo "the guard is already running" >&2; exit 0; }
+	trap 'rm -f "$OUT" "$LOCK"; exit 0' INT TERM
+	state_load; load_conf
+	log "guard started (checks every ${INTERVAL}s)"
+	while :; do
+		load_conf
+		cycle
+		state_save
+		rm -f "$OUT"
+		sleep "$INTERVAL" &
+		wait $!
+	done
+}
+
+cmd_run() {
+	take_lock || { echo "the guard daemon is running; it does this by itself" >&2; exit 1; }
+	state_load; load_conf
+	cycle
+	state_save
+	rm -f "$OUT" "$LOCK"
+}
+
+cmd_save() {  # at shutdown: one last copy of the settings, if they changed
+	state_load; load_conf
+	UP="$(num "$(now_up)")"
+	zt_enabled || exit 0
+	IDS="$(network_ids | tr '\n' ' ')"
+	check_health
+	for cs_id in $H_OK_IDS; do cache_save "$cs_id" force; done
+	history_flush force
+	state_save
+	rm -f "$OUT"
+}
+
+cmd_confirm() {
+	mkdir -p "$RAM" 2>/dev/null
+	UP="$(num "$(now_up)")"
+	if [ -e "$PENDING" ]; then
+		rm -f "$PENDING" && log "firmware upgrade confirmed by the administrator's PC after ${UP}s of uptime"
+		echo "Подтверждено: метка ожидания после прошивки снята, сторож не будет идти по шагам восстановления."
+	else
+		echo "Метки ожидания после прошивки нет: подтверждать нечего."
+	fi
+	if [ "$(reboot_count)" -gt 0 ]; then
+		flash_write "$REBOOTS" "count=0
+last=$(stamp)
+reason=confirmed by the administrator"
+	fi
+}
+
+ru_reason() {
+	case "$1" in
+		ok) echo 'всё в порядке' ;;
+		idle) echo 'ZeroTier выключен или сеть не задана — сторожить нечего' ;;
+		refused) echo 'контроллер не пускает этот роутер в сеть (не авторизован) — сторож здесь бессилен, ждёт авторизации' ;;
+		daemon-dead) echo 'программа ZeroTier не запущена' ;;
+		no-answer) echo 'программа ZeroTier не отвечает' ;;
+		offline) echo 'ZeroTier не в сети (OFFLINE)' ;;
+		no-root) echo 'нет связи ни с одним корневым сервером ZeroTier' ;;
+		network-no-settings) echo 'сеть ждёт настроек от контроллера' ;;
+		no-internet) echo 'у роутера нет выхода в интернет — сторож ждёт, ничего не трогая' ;;
+		controller-silent) echo 'контроллер ZeroTier перестал обновлять настройки сети: пропуск роутера устаревает, через полчаса другие участники перестанут его пускать' ;;
+		network-absent) echo 'сеть из настроек не подключена' ;;
+		no-address) echo 'сеть подключена, но адреса нет' ;;
+		address-not-on-interface) echo 'адрес выдан, но на интерфейсе его нет' ;;
+		unconfirmed) echo 'ПК не подтвердил вход после прошивки' ;;
+		'') echo 'ещё не проверялось' ;;
+		*) echo "$1" ;;
+	esac
+}
+
+cmd_status() {
+	st_lines="${1:-12}"
+	state_load; load_conf
+	UP="$(num "$(now_up)")"
+	st_run='нет'
+	st_p="$(cat "$LOCK" 2>/dev/null)"
+	[ -n "$st_p" ] && kill -0 "$st_p" 2>/dev/null && st_run='да'
+	echo "== Сторож доступа ZeroTier =="
+	printf 'Версия: %s\n' "$GUARD_VERSION"
+	printf 'Сторож запущен: %s\n' "$st_run"
+	printf 'Состояние: %s\n' "$(ru_reason "$S_HEALTH")"
+	if [ "$S_FAIL_SINCE" -gt 0 ]; then
+		printf 'Неполадка длится: %s с; сделано: %s\n' "$(( UP - S_FAIL_SINCE ))" "${S_STEPS:-пока ничего}"
+		[ -z "$S_BUSY" ] || printf 'Шаги придержаны: идёт %s\n' "$S_BUSY"
+	fi
+	[ "$S_PODKOP_RESUME" -gt 0 ] && printf 'Подкоп на паузе, вернётся через %s с\n' "$(( S_PODKOP_RESUME - UP ))"
+	if [ -e "$PENDING" ]; then
+		case "$(head -c 7 "$PENDING" 2>/dev/null)" in
+			pending) printf 'После прошивки: жду подтверждения от ПК (до %s с работы роутера, сейчас %s с)\n' "$CONFIRM" "$UP" ;;
+			*) printf 'После прошивки: подтверждения не было, шаги восстановления пройдены один раз (%s)\n' "$(cut -d" " -f2- "$PENDING" 2>/dev/null)" ;;
+		esac
+	fi
+	for st_f in "$FLASH"/network-*.cache; do
+		[ -f "$st_f" ] || continue
+		st_id="$(basename "$st_f" .cache)"; st_id="${st_id#network-}"
+		st_h="$(head -n 1 "$st_f" 2>/dev/null)"
+		set -- $st_h
+		if cache_valid "$st_id"; then st_v='целы'; else st_v='повреждены или устарели'; fi
+		printf 'Сохранённые настройки сети …%s: %s, записаны %s с назад\n' "$(printf '%s' "$st_id" | cut -c13-16)" "$st_v" "$(( $(now_epoch) - $(num "${5:-}") ))"
+	done
+	[ -z "$S_ROOTS" ] || printf 'Корневые серверы ZeroTier: видно %s\n' "$(printf '%s' "$S_ROOTS" | sed 's/of/ из /')"
+	printf 'Перезагрузок сторожем подряд: %s\n' "$(reboot_count)"
+	if [ -s "$FLASH/incidents" ] || [ -s "$RAM/incidents.pending" ]; then
+		st_hist="$( { cat "$FLASH/incidents" 2>/dev/null; cat "$RAM/incidents.pending" 2>/dev/null; } | tail -n 40)"
+		echo "-- последние происшествия (всего $(printf '%s\n' "$st_hist" | grep -c .)) --"
+		printf '%s\n' "$st_hist" | tail -n 5
+	fi
+	st_inc="$RAM/last-incident"; [ -f "$st_inc" ] || st_inc="$INCIDENT"
+	if [ -f "$st_inc" ]; then
+		echo "-- последнее происшествие --"
+		cat "$st_inc"
+	fi
+	if [ -f "$LOG" ]; then
+		echo "-- журнал (последние строки) --"
+		tail -n "$st_lines" "$LOG"
+	fi
+}
+
+mkdir -p "$RAM" 2>/dev/null
+case "${1:-status}" in
+	daemon) cmd_daemon ;;
+	run) cmd_run ;;
+	save) cmd_save ;;
+	confirm) cmd_confirm ;;
+	status) cmd_status "${2:-12}" ;;
+	log) cat "$LOG" 2>/dev/null ;;
+	version) echo "$GUARD_VERSION" ;;
+	*) echo "Usage: $0 {status [lines]|confirm|log|version|run|save|daemon}" >&2; exit 2 ;;
+esac

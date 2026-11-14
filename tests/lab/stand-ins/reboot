@@ -1,0 +1,3 @@
+#!/bin/sh
+# Lab stand-in for reboot: only writes down that it was asked for.
+echo "$(date +%H:%M:%S) reboot" >> /tmp/lab/reboots

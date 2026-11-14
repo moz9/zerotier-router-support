@@ -20,5 +20,5 @@ jobs:
         run: sh tests/local-conf.sh openwrt/usr/libexec/zerotier-support/helper
       - name: ShellCheck
         run: |
-          shellcheck --severity=warning -s sh openwrt/usr/libexec/zerotier-support/helper router-install.sh router-direct-install.sh
+          shellcheck --severity=warning -s sh openwrt/usr/libexec/zerotier-support/helper openwrt/usr/libexec/zerotier-support/guard router-install.sh router-direct-install.sh tests/guard-scenarios.sh
           shellcheck --severity=warning install.sh

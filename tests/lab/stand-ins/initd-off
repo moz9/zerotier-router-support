@@ -1,0 +1,3 @@
+#!/bin/sh
+# Lab stand-in for a service that is switched off (dropbear in the lab).
+exit 1

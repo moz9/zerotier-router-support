@@ -103,6 +103,23 @@ cp "${OVERLAY_DIR}/usr/share/rpcd/acl.d/zerotier-support.json" "${RPC_ACL_DIR}/z
 cp "${OVERLAY_DIR}/usr/share/luci/menu.d/zerotier-support.json" "${LUCI_MENU_DIR}/zerotier-support.json"
 cp "${OVERLAY_DIR}/www/luci-static/resources/view/services/zerotier.js" "${LUCI_VIEW_DIR}/zerotier.js"
 cp "${OVERLAY_DIR}/lib/upgrade/keep.d/zerotier-router-support" "${KEEP_DIR}/zerotier-router-support"
+# The access guard (optional in the payload: an older bundle simply has none)
+GUARD_SRC="${OVERLAY_DIR}/usr/libexec/zerotier-support/guard"
+GUARD_INIT="${ZRS_INIT_DIR:-/etc/init.d}/zerotier-guard"
+# An interrupted install must not leave the guard half in place: its program first, the service script last
+# (a service script without its program does nothing), each put there by a rename. The service is switched on
+# only at the very end, after everything else has succeeded.
+if [ -f "$GUARD_SRC" ] && [ -f "${OVERLAY_DIR}/etc/init.d/zerotier-guard" ] && [ -f "${OVERLAY_DIR}/lib/upgrade/keep.d/zerotier-guard" ]; then
+	cp "$GUARD_SRC" "${HELPER_DIR}/guard.new"
+	chmod 0755 "${HELPER_DIR}/guard.new"
+	mv "${HELPER_DIR}/guard.new" "${HELPER_DIR}/guard"
+	cp "${OVERLAY_DIR}/lib/upgrade/keep.d/zerotier-guard" "${KEEP_DIR}/zerotier-guard.new"
+	chmod 0644 "${KEEP_DIR}/zerotier-guard.new"
+	mv "${KEEP_DIR}/zerotier-guard.new" "${KEEP_DIR}/zerotier-guard"
+	cp "${OVERLAY_DIR}/etc/init.d/zerotier-guard" "${GUARD_INIT}.new"
+	chmod 0755 "${GUARD_INIT}.new"
+	mv "${GUARD_INIT}.new" "$GUARD_INIT"
+fi
 
 chmod 0755 "${HELPER_DIR}/helper"
 chmod 0644 "${HELPER_DIR}/20-podkop-zerotier-bypass.nft"
@@ -132,11 +149,25 @@ fi
 echo "== Prepare firewall =="
 "${HELPER_DIR}/helper" install
 
+if [ -x "${HELPER_DIR}/guard" ] && [ -x "$GUARD_INIT" ]; then
+	echo "== Access guard =="
+	# ZRS_GUARD=0 installs the files but leaves the guard switched off
+	if [ "${ZRS_GUARD:-1}" = 1 ]; then
+		"$GUARD_INIT" enable
+		"$GUARD_INIT" restart
+		echo "Сторож доступа включён. Состояние: ${HELPER_DIR}/guard status"
+	else
+		"$GUARD_INIT" stop 2>/dev/null || true
+		"$GUARD_INIT" disable 2>/dev/null || true
+		echo "Сторож доступа установлен, но выключен (ZRS_GUARD=0)."
+	fi
+fi
+
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart 2>/dev/null || true
 
 echo
-echo "Панель ZeroTier-поддержки установлена."
+echo "Панель ZeroTier-поддержки установлена, версия $("${HELPER_DIR}/helper" version 2>/dev/null || echo '?')."
 echo "Откройте LuCI: Службы -> ZeroTier"
 echo "Введите там Network ID, затем авторизуйте роутер в ZeroTier Central."

@@ -1,0 +1,6 @@
+/usr/libexec/zerotier-support/guard
+/etc/init.d/zerotier-guard
+/etc/rc.d/S91zerotier-guard
+/etc/rc.d/K05zerotier-guard
+/etc/zerotier-support/
+/lib/upgrade/keep.d/zerotier-guard

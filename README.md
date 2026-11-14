@@ -24,6 +24,12 @@
   - раннее nftables-правило выводит только пакеты ZeroTier из перехвата Podkop;
   - правило сохраняется после перезагрузки роутера и `firewall reload`;
   - ZeroTier продолжает работать при остановленном sing-box, сломанной подписке или DNS Podkop.
+- Сторож доступа (служба `zerotier-guard`):
+  - раз в минуту проверяет, что ZeroTier запущен, в сети, сеть подключена и адрес на месте;
+  - чинит сам, по шагам: запуск упавшей программы, перезапуск службы, возврат обхода и правил файрвола, короткая пауза Podkop, в крайнем случае одна редкая перезагрузка;
+  - хранит на флеше последние рабочие настройки сети и подставляет их, если контроллер ZeroTier не отвечает;
+  - настройки не меняет; во время прошивки и установки пакетов ничего не делает;
+  - не поможет, если роутер не загружается или не поднимается WAN. Подробно: [docs/access-guard.md](docs/access-guard.md).
 
 ## Универсальная установка и обновление
 
@@ -89,7 +95,13 @@ uci -q delete firewall.allow_zt_support_ping || true
 uci commit zerotier 2>/dev/null || true
 uci commit firewall 2>/dev/null || true
 
+/etc/init.d/zerotier-guard stop 2>/dev/null || true
+/etc/init.d/zerotier-guard disable 2>/dev/null || true
+
 rm -f \
+  /usr/libexec/zerotier-support/guard \
+  /etc/init.d/zerotier-guard \
+  /lib/upgrade/keep.d/zerotier-guard \
   /usr/libexec/zerotier-support/helper \
   /usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft \
   /usr/libexec/zerotier-support/zerotier-router-support.conf \
@@ -101,6 +113,7 @@ rm -f \
   /www/luci-static/resources/view/services/zerotier.js \
   /lib/upgrade/keep.d/zerotier-router-support \
   /www/luci-static/resources/view/system/zerotier-support.js
+rm -rf /etc/zerotier-support /tmp/zerotier-support
 rmdir /usr/libexec/zerotier-support 2>/dev/null || true
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
 

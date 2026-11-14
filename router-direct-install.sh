@@ -60,6 +60,31 @@ fetch_file "openwrt/usr/share/rpcd/acl.d/zerotier-support.json"
 fetch_file "openwrt/usr/share/luci/menu.d/zerotier-support.json"
 fetch_file "openwrt/www/luci-static/resources/view/services/zerotier.js"
 fetch_file "openwrt/lib/upgrade/keep.d/zerotier-router-support"
+fetch_file "openwrt/usr/libexec/zerotier-support/guard"
+fetch_file "openwrt/etc/init.d/zerotier-guard"
+fetch_file "openwrt/lib/upgrade/keep.d/zerotier-guard"
+
+# Nothing is installed from an incomplete or damaged download: every file is compared with the list of
+# checksums published in the same revision (the upgrade usually runs over ZeroTier itself, on any kind of line).
+fetch_file "openwrt/MANIFEST.sha256"
+echo "== Проверка загруженных файлов =="
+verify_download() {
+	vd_bad=0; vd_n=0
+	while read -r vd_want vd_path; do
+		case "$vd_want" in ''|'#'*) continue ;; esac
+		vd_n=$((vd_n + 1))
+		if [ ! -f "${TMP_DIR}/${vd_path}" ]; then echo "Не загружен: ${vd_path}" >&2; vd_bad=1; continue; fi
+		vd_have="$(sha256sum "${TMP_DIR}/${vd_path}" | cut -d' ' -f1)"
+		[ "$vd_have" = "$vd_want" ] || { echo "Повреждён при загрузке: ${vd_path}" >&2; vd_bad=1; }
+	done < "${TMP_DIR}/openwrt/MANIFEST.sha256"
+	[ "$vd_n" -ge 8 ] || { echo "Список контрольных сумм неполон." >&2; vd_bad=1; }
+	return "$vd_bad"
+}
+if ! verify_download; then
+	echo "Установка не начиналась: загрузка неполная или повреждена. На роутере ничего не изменено. Повторите позже." >&2
+	exit 1
+fi
+echo "Все файлы загружены целиком: $(sed -n '1s/^# *//p' "${TMP_DIR}/openwrt/MANIFEST.sha256")"
 
 if [ -n "${ZRS_PUBKEY:-}" ]; then
 	printf '%s\n' "$ZRS_PUBKEY" > "${TMP_DIR}/router-support-ed25519.pub"

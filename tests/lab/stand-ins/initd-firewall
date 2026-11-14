@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lab stand-in for /etc/init.d/firewall: enabled; a reload is written down.
+case "${1:-}" in enabled) exit 0 ;; reload|restart) echo "$(date +%H:%M:%S) firewall $1" >> /tmp/lab/firewall-calls ;; esac
+exit 0

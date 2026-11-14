@@ -1,0 +1,31 @@
+#!/bin/sh
+# Lab stand-in for ubus, enough for /etc/rc.common to start and stop one procd service: "call service set" hands
+# the instance's command line to mini-procd, "call service delete" stops the instance and waits until it is gone.
+# Everything else answers "not found", as ubus does without a daemon.
+D=/tmp/lab/procd
+echo "$*" >> /tmp/lab/ubus-calls 2>/dev/null
+while [ $# -gt 0 ] && [ "$1" != call ]; do shift; done
+[ "${2:-}" = service ] || exit 4
+name="$(jsonfilter -s "${4:-}" -e '@.name' 2>/dev/null)"
+case "$3" in
+	set|add)
+		[ "$name" = zerotier ] || exit 0
+		jsonfilter -s "$4" -e '@.instances.*.command[*]' 2>/dev/null | tr '\n' ' ' > "$D/$name.cmd.new"
+		[ -s "$D/$name.cmd.new" ] || { rm -f "$D/$name.cmd.new"; exit 0; }
+		mv "$D/$name.cmd.new" "$D/$name.cmd"; : > "$D/$name.set" ;;
+	delete)
+		[ "$name" = zerotier ] || exit 0
+		rm -f "$D/$name.cmd"
+		p="$(cat "$D/$name.pid" 2>/dev/null)"
+		if [ -n "$p" ]; then
+			kill "$p" 2>/dev/null
+			i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 8 ]; do sleep 1; i=$((i + 1)); done
+			kill -9 "$p" 2>/dev/null
+		fi ;;
+	list)
+		if [ "$name" = zerotier ] && [ -f "$D/zerotier.cmd" ]; then
+			echo '{"zerotier":{"instances":{"instance1":{"running":true,"respawn":{"threshold":3600,"timeout":5,"retry":5}}}}}'
+		else echo '{}'; fi ;;
+	*) exit 4 ;;
+esac
+exit 0

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Lab stand-in for procd's care of one service instance, with procd's own rules (procd: service/instance.c):
+# a program that exits is started again after 5 seconds; each exit after less than an hour of running counts as a
+# crash, and after more than 5 such crashes in a row procd stops trying ("crash loop") until the service is set
+# again by its init script. The init script itself is not run on a respawn.
+D=/tmp/lab/procd; n=zerotier
+count=0; faulted=0; pid=''; started=0; wait_until=0
+log() { echo "$(date +%H:%M:%S) mini-procd: $*" >> "$D/log"; }
+up() { cut -d. -f1 /proc/uptime; }
+trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; exit 0' INT TERM
+while :; do
+	if [ -e "$D/$n.set" ]; then rm -f "$D/$n.set"; count=0; faulted=0; wait_until=0; log "service set by its init script"; fi
+	if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+		wait "$pid" 2>/dev/null; pid=''; rm -f "$D/$n.pid"
+		if [ -f "$D/$n.cmd" ]; then
+			if [ $(( $(up) - started )) -lt 3600 ]; then count=$((count + 1)); else count=0; fi
+			if [ "$count" -gt 5 ]; then faulted=1; log "crash loop ($count exits): giving up, as procd does"
+			else wait_until=$(( $(up) + 5 )); log "instance exited (#$count): again in 5 s"; fi
+		fi
+	fi
+	if [ -f "$D/$n.cmd" ] && [ -z "$pid" ] && [ "$faulted" = 0 ] && [ "$(up)" -ge "$wait_until" ]; then
+		# lab plumbing: where our stand-in for ZeroTier's root servers lives (a router needs nothing like it)
+		mkdir -p /var/lib/zerotier-one/moons.d && cp /tmp/lab/moon/*.moon /var/lib/zerotier-one/moons.d/ 2>/dev/null
+		$(cat "$D/$n.cmd") > /dev/null 2>&1 &
+		pid=$!; echo "$pid" > "$D/$n.pid"; started="$(up)"; log "instance started (pid $pid)"
+	fi
+	if [ ! -f "$D/$n.cmd" ] && [ -n "$pid" ]; then kill "$pid" 2>/dev/null; fi
+	sleep 1
+done
