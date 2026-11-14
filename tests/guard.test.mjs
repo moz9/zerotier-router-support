@@ -50,6 +50,7 @@ test('the guard never changes settings, installs nothing and deletes nothing of 
 
 test('reboot is off by default; when switched on it is the last step, rare, never during an upgrade or an install', () => {
   assert.match(code, /^REBOOT=0\b/m, 'the reboot step must be off by default (the owner decided so)');
+  assert.match(code, /^PODKOP=0\b/m, 'the Podkop pause must be off by default (the owner decided so)');
   assert.match(code, /REBOOT_MIN_UPTIME=1800/);
   assert.match(code, /REBOOT_GAP=21600/);
   assert.match(code, /FAIL_REBOOT=1800/);

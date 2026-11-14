@@ -3,7 +3,7 @@
 #
 # Keeps the remote door of this router open by itself:
 #   - watches the ZeroTier daemon (alive, ONLINE, network OK, address present, a root server reachable);
-#   - repairs by steps with back-off (a reboot only when switched on: REBOOT=1): restart the service -> re-apply the app's own live firewall state
+#   - repairs by steps with back-off (a Podkop pause and a reboot only when switched on): restart the service -> re-apply the app's own live firewall state
 #     -> pause Podkop for a few minutes (its own init script only) -> one reboot, rarely;
 #   - keeps the last known network settings on flash and puts them back when the controller does not answer;
 #   - after a firmware upgrade waits for the administrator's PC to confirm that it got in, and walks the same
@@ -42,7 +42,8 @@ INTERVAL=60            # seconds between checks
 FAIL_RESTART=180       # unhealthy this long -> restart the ZeroTier service
 FAIL_REAPPLY=360       # -> re-apply the bypass file and the live firewall state
 FAIL_PODKOP=720        # -> pause Podkop
-PODKOP=1               # 0: never touch Podkop
+PODKOP=0               # 1: allow the Podkop pause step. Off by default (the owner's decision, 2026-11-14: the guard
+                       # must never cut the proxy for the people behind the router; Podkop has its own fail-open)
 PODKOP_PAUSE=300       # for how long
 PODKOP_GAP=21600       # and not again sooner than this
 FAIL_REBOOT=1800       # unhealthy this long -> reboot, if allowed
@@ -478,15 +479,22 @@ runtime_ports() {
 }
 # Re-apply what the app owns, live only: the bypass file from its template when the file is gone, a firewall
 # reload so that the file and the saved rules are in force, the ports the daemon really uses in the bypass set.
+# The firewall is reloaded only when something the app owns is really missing from it: a reload touches every rule on
+# the users' path. Otherwise only the bypass port set is brought in line with the ports the daemon uses.
 do_reapply() {  # <why>
 	S_REAPPLY_AT=$UP; add_step 'reapply'
-	log "step: re-apply the bypass and the firewall state ($1)"
-	if [ ! -f "$BYPASS_FILE" ] && [ -s "$BYPASS_TEMPLATE" ]; then
-		mkdir -p "$(dirname "$BYPASS_FILE")" && cp "$BYPASS_TEMPLATE" "$BYPASS_FILE.new" && chmod 0644 "$BYPASS_FILE.new" &&
-			mv "$BYPASS_FILE.new" "$BYPASS_FILE" && log "the bypass file was missing: restored from the app's template"
-	fi
-	if [ -x "$INITD/firewall" ] && "$INITD/firewall" enabled >/dev/null 2>&1; then
-		"$INITD/firewall" reload >/dev/null 2>&1 || log "firewall reload returned an error"
+	ra_missing="$(live_missing)"
+	if [ -n "$ra_missing" ]; then
+		log "step: re-apply the bypass and the firewall state ($1; missing: $ra_missing)"
+		if [ ! -f "$BYPASS_FILE" ] && [ -s "$BYPASS_TEMPLATE" ]; then
+			mkdir -p "$(dirname "$BYPASS_FILE")" && cp "$BYPASS_TEMPLATE" "$BYPASS_FILE.new" && chmod 0644 "$BYPASS_FILE.new" &&
+				mv "$BYPASS_FILE.new" "$BYPASS_FILE" && log "the bypass file was missing: restored from the app's template"
+		fi
+		if [ -x "$INITD/firewall" ] && "$INITD/firewall" enabled >/dev/null 2>&1; then
+			"$INITD/firewall" reload >/dev/null 2>&1 || log "firewall reload returned an error"
+		fi
+	else
+		log "step: re-apply the bypass port set ($1; the firewall state is complete, no reload)"
 	fi
 	if have nft && nft list set inet fw4 podkop_zerotier_udp_ports >/dev/null 2>&1; then
 		ra_ports="$ZT_PORTS"
@@ -652,7 +660,7 @@ cycle() {
 		[ "$cy_gap" -le 3600 ] || cy_gap=3600
 		if [ "$S_LIVE_N" = 0 ] || [ $(( UP - S_LIVE_AT )) -ge "$cy_gap" ]; then
 			S_LIVE_AT=$UP; S_LIVE_N=$(( S_LIVE_N + 1 ))
-			do_reapply "missing: $cy_live"
+			do_reapply 'live state'
 		fi
 	fi
 

@@ -53,7 +53,7 @@ world() {
 	echo 777 > "$W/dropbear_pid"
 	printf 'zerotier.global.enabled=1\nzerotier.router_support.allow_managed=1\nfirewall.allow_zt_support_router.target=ACCEPT\n' > "$W/uci"
 	printf "zerotier.global=zerotier\nzerotier.global.enabled='1'\nzerotier.router_support=network\nzerotier.router_support.id='%s'\n" "$ID" > "$W/uci_show"
-	printf 'REBOOT=1\nCLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"   # the reboot step is off by default
+	printf 'REBOOT=1\nPODKOP=1\nCLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"   # both are off by default
 	echo 'set podkop_zerotier_udp_ports { }' > "$T/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft"
 	cp "$T/usr/libexec/zerotier-support/20-podkop-zerotier-bypass.nft" "$T/etc/nftables.d/20-podkop-zerotier-bypass.nft"
 	conf_text 1000 > "$T/var/lib/zerotier-one/networks.d/$ID.conf"
@@ -161,11 +161,11 @@ if want offline-ladder; then world offline-ladder
 	at 60; break_zt
 	at 120; at 180; expect_actions '' 'nothing in the first minutes of OFFLINE'
 	at 240; at 300; expect_actions 'zerotier restart' 'restart after three minutes'
-	span 360 480; expect_actions 'zerotier restart;firewall reload;nft sync' 'then the live firewall state'
-	span 540 780; expect_actions 'zerotier restart;firewall reload;nft sync;zerotier restart' 'second restart'
-	span 840 900; expect_actions 'zerotier restart;firewall reload;nft sync;zerotier restart;podkop stop' 'then Podkop is paused'
+	span 360 480; expect_actions 'zerotier restart;nft sync' 'then the live firewall state'
+	span 540 780; expect_actions 'zerotier restart;nft sync;zerotier restart' 'second restart'
+	span 840 900; expect_actions 'zerotier restart;nft sync;zerotier restart;podkop stop' 'then Podkop is paused'
 	span 960 1140
-	expect_actions 'zerotier restart;firewall reload;nft sync;zerotier restart;podkop stop;zerotier restart;podkop start' 'a restart while Podkop is paused, then Podkop comes back by itself'
+	expect_actions 'zerotier restart;nft sync;zerotier restart;podkop stop;zerotier restart;podkop start' 'a restart while Podkop is paused, then Podkop comes back by itself'
 	span 1200 1860; check 'no reboot before half an hour of failure' "$(count reboot)" 0
 	span 1920 1980; check 'one reboot after half an hour' "$(count reboot)" 1
 	grep -q '^count=1' "$T/etc/zerotier-support/reboots" && ok || bad 'the reboot is not counted on flash'
@@ -316,9 +316,9 @@ if want late-check; then world late-check
 	expect_actions 'zerotier restart' 'after a long gap the first step is still the lightest one'
 	at 7260; expect_actions 'zerotier restart' 'the daemon just restarted is given time to come up'
 	at 7320; at 7380
-	expect_actions 'zerotier restart;firewall reload;nft sync;podkop stop' 'then one step per check'
+	expect_actions 'zerotier restart;nft sync;podkop stop' 'then one step per check'
 	span 7440 7740
-	expect_actions 'zerotier restart;firewall reload;nft sync;podkop stop;zerotier restart;podkop start;reboot' 'the reboot is last and waits until Podkop is running again'
+	expect_actions 'zerotier restart;nft sync;podkop stop;zerotier restart;podkop start;reboot' 'the reboot is last and waits until Podkop is running again'
 fi
 
 if want just-started; then world just-started
@@ -464,7 +464,7 @@ if want no-internet; then world no-internet
 	span 9300 9360
 	expect_actions 'zerotier restart' 'then the steps begin from the first one'
 	span 9420 9600
-	expect_actions 'zerotier restart;firewall reload;nft sync' 'and go on at their usual pace'
+	expect_actions 'zerotier restart;nft sync' 'and go on at their usual pace'
 	world no-route; CUR=no-internet/no-default-route
 	: > "$W/route"; at 60; break_zt; span 120 6000 300
 	expect_actions '' 'no default route: no step'
@@ -511,6 +511,9 @@ if want default-no-reboot; then world default-no-reboot
 	printf 'CLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"
 	at 60; break_zt; span 120 2400; span 2700 30000 900
 	check 'OFFLINE for eight hours: no reboot' "$(count reboot)" 0
+	check 'Podkop is never touched' "$(grep -c '^podkop' "$W/actions")" 0
+	check 'and the firewall is never reloaded (nothing of the app is missing)' "$(count 'firewall reload')" 0
+	log_has 'the firewall state is complete, no reload'
 	check 'the restarts go on, an hour apart' "$([ "$(count 'zerotier restart')" -ge 8 ] && echo yes)" yes
 	[ ! -e "$T/etc/zerotier-support/reboots" ] && ok || bad 'a reboot counter was written'
 	world default-no-reboot-dead; CUR=default-no-reboot/dead-daemon
@@ -522,7 +525,9 @@ if want default-no-reboot; then world default-no-reboot
 	printf 'CLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"
 	echo pending > "$T/etc/zerotier-support/upgrade-pending"
 	span 60 2640
-	expect_actions 'zerotier restart;firewall reload;nft sync;zerotier restart;podkop stop;zerotier restart;podkop start' 'an unconfirmed upgrade: the steps once, without a reboot'
+	check 'an unconfirmed upgrade: restarts' "$([ "$(count 'zerotier restart')" -ge 2 ] && echo yes)" yes
+	check 'and the port set' "$(count 'nft sync')" 1
+	check 'never Podkop, a firewall reload or a reboot' "$(grep -c 'podkop\|firewall reload\|reboot' "$W/actions")" 0
 	span 2700 2820
 	grep -q '^used ' "$T/etc/zerotier-support/upgrade-pending" && ok || bad 'the marker is not spent'
 	: > "$W/actions"; span 2880 20000 900
@@ -535,7 +540,7 @@ if want upgrade-not-confirmed; then world upgrade-not-confirmed
 	expect_actions '' 'nothing while the PC still has time to confirm'
 	span 1080 1140; expect_actions 'zerotier restart' 'first step three minutes after the deadline'
 	span 1200 2640
-	expect_actions 'zerotier restart;firewall reload;nft sync;zerotier restart;podkop stop;zerotier restart;podkop start' 'the same steps as for a fault'
+	expect_actions 'zerotier restart;nft sync;zerotier restart;podkop stop;zerotier restart;podkop start' 'the same steps as for a fault'
 	span 2700 2760; check 'one reboot' "$(count reboot)" 1
 	grep -q '^used ' "$T/etc/zerotier-support/upgrade-pending" && ok || bad 'the marker is not spent'
 	: > "$W/actions"
@@ -574,7 +579,7 @@ if want podkop; then
 		check 'Podkop is not touched' "$(grep -c '^podkop' "$W/actions")" 0
 	done
 	world podkop-once; CUR=podkop/once-in-six-hours
-	printf 'REBOOT=0\nCLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"
+	printf 'REBOOT=0\nPODKOP=1\nCLI_TIMEOUT=0\n' > "$T/etc/zerotier-support/guard.conf"
 	at 60; break_zt; span 120 1200; span 1800 21000 1800
 	check 'one pause in the first six hours' "$(count 'podkop stop')" 1
 	check 'and Podkop was started again' "$(count 'podkop start')" 1
